@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1">
+      <stop stop-color="#b99aa7"/>
+      <stop offset=".48" stop-color="#e4a5a7"/>
+      <stop offset=".78" stop-color="#f6a176"/>
+      <stop offset="1" stop-color="#f7bd83"/>
+    </linearGradient>
+    <linearGradient id="stone" x2=".8" y2="1">
+      <stop stop-color="#a8b1b0"/>
+      <stop offset=".45" stop-color="#6c7b80"/>
+      <stop offset="1" stop-color="#39484e"/>
+    </linearGradient>
+    <linearGradient id="side" x2="1" y2="1">
+      <stop stop-color="#728084"/>
+      <stop offset="1" stop-color="#29363d"/>
+    </linearGradient>
+    <linearGradient id="glass" x2="0" y2="1">
+      <stop stop-color="#8ec6d4"/>
+      <stop offset=".5" stop-color="#1b718f"/>
+      <stop offset="1" stop-color="#173a50"/>
+    </linearGradient>
+    <pattern id="grain" width="38" height="38" patternUnits="userSpaceOnUse">
+      <path d="M4 8h1m17 4h1M9 29h1m22-9h1" stroke="#fff" stroke-opacity=".14"/>
+      <path d="M2 19h1m27 15h1m-13-29h1" stroke="#16252b" stroke-opacity=".13"/>
+    </pattern>
+    <pattern id="windows" width="150" height="126" patternUnits="userSpaceOnUse">
+      <path d="M33 21h39v78H33z" fill="url(#glass)" stroke="#d3d9d5" stroke-width="5"/>
+      <path d="M52 22v75M34 61h37" stroke="#d5ddda" stroke-opacity=".72" stroke-width="3"/>
+      <path d="M101 21h28v78h-28z" fill="#43555b" stroke="#c6cecb" stroke-width="5"/>
+    </pattern>
+  </defs>
+  <path fill="url(#sky)" d="M0 0h1600v1000H0z"/>
+  <path fill="#f2bcaa" opacity=".16" d="M0 390 710 270l890 80v240L0 690z"/>
+  <path fill="#f8d3b0" opacity=".2" d="M0 610 700 415l900 35v95L0 815z"/>
+  <path fill="url(#side)" stroke="#d1d1c9" stroke-width="8" d="m-60 635 185-220 484 130 158-92 440 118 155-100 300 102v427H-60z"/>
+  <path fill="url(#stone)" stroke="#cbd0ca" stroke-width="9" d="m-60 635 185-220 484 130-139 455H-60z"/>
+  <path fill="url(#grain)" d="m-60 635 185-220 484 130-139 455H-60z"/>
+  <path fill="url(#side)" stroke="#cbd0ca" stroke-width="9" d="m470 545 297-199 440 118-150 536H470z"/>
+  <path fill="url(#windows)" opacity=".96" d="m-20 620 145-172 432 116-123 412H-20z"/>
+  <path fill="url(#windows)" opacity=".92" d="m500 550 267-181 414 111-137 475H500z"/>
+  <path fill="#dbe0db" stroke="#aab4b1" stroke-width="6" d="m1060 470 150-100 390 120v90l-312-85-60 70z"/>
+  <path fill="url(#stone)" stroke="#cbd0ca" stroke-width="8" d="m1040 505 170-135 390 120v510h-510z"/>
+  <path fill="url(#grain)" d="m1040 505 170-135 390 120v510h-510z"/>
+  <path fill="url(#windows)" opacity=".94" d="m1080 520 132-105 345 106v442h-477z"/>
+  <path fill="#c5ccca" opacity=".7" d="m1220 370 65 21-70 128-66-25z"/>
+  <path fill="#e1e2db" opacity=".82" d="m770 346 69 18-61 116-74-21z"/>
+  <path fill="#141b20" opacity=".22" d="M0 760h1600v240H0z"/>
+</svg>
