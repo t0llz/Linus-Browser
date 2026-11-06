@@ -19,8 +19,8 @@ use std::{
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry,
     EntryIconPosition, GestureClick, Image, Label, MenuButton, Orientation, Popover, ProgressBar,
-    STYLE_PROVIDER_PRIORITY_USER, SearchEntry, Stack, Switch, WindowHandle, gdk, gio,
-    glib, pango, prelude::*, style_context_add_provider_for_display,
+    STYLE_PROVIDER_PRIORITY_USER, SearchEntry, Stack, Switch, WindowHandle, gdk, gio, glib, pango,
+    prelude::*, style_context_add_provider_for_display,
 };
 use webkit6::{
     CookieAcceptPolicy, FindOptions, LoadEvent, NavigationPolicyDecision, NetworkSession,
@@ -187,13 +187,10 @@ const AD_CLEANER_SCRIPT: &str = r#"
     [data-sponsored="true"],
     [aria-label="Advertisement"],
     [aria-label="Sponsored"],
-    .ad,
-    .ads,
     .ad-banner,
     .ad-container,
     .ad-wrapper,
     .advertisement,
-    .advert,
     .sponsored-content,
     .sponsored-post,
     .promoted-post,
@@ -242,8 +239,14 @@ const AD_CLEANER_SCRIPT: &str = r#"
 
 // ───────────────────────────── persistence ─────────────────────────────
 
+/// Root of the browser's own state directory.
+///
+/// `LINUS_BROWSER_DATA_DIR` overrides it so a test run can use a throwaway
+/// profile instead of the user's real bookmarks, history and preferences.
 fn data_dir() -> PathBuf {
-    let d = glib::user_config_dir().join("linus-browser");
+    let d = std::env::var_os("LINUS_BROWSER_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| glib::user_config_dir().join("linus-browser"));
     let _ = fs::create_dir_all(&d);
     d
 }
@@ -328,6 +331,9 @@ struct Prefs {
     block_cookies: bool,
     bookmarks_bar: bool,
     search_engine: String,
+    theme: String,
+    show_top_sites: bool,
+    hidden_top_sites: HashSet<String>,
     background_images: bool,
     wallpaper_style: String,
     fingerprint_farbling: bool,
@@ -341,6 +347,9 @@ impl Prefs {
             block_cookies: true,
             bookmarks_bar: true,
             search_engine: "duckduckgo".to_string(),
+            theme: "dark".to_string(),
+            show_top_sites: true,
+            hidden_top_sites: HashSet::new(),
             background_images: true,
             wallpaper_style: "default".to_string(),
             fingerprint_farbling: true,
@@ -356,10 +365,17 @@ impl Prefs {
                     "search_engine" if matches!(v, "duckduckgo" | "google" | "brave") => {
                         p.search_engine = v.to_string()
                     }
+                    "theme" if is_browser_theme(v) => p.theme = v.to_string(),
+                    "show_top_sites" => p.show_top_sites = v == "1",
+                    "hidden_top_sites" => {
+                        p.hidden_top_sites = v
+                            .split(',')
+                            .filter(|host| is_valid_site_host(host))
+                            .map(str::to_ascii_lowercase)
+                            .collect()
+                    }
                     "background_images" => p.background_images = v == "1",
-                    "wallpaper_style"
-                        if matches!(v, "default" | "custom" | "solid" | "gradient") =>
-                    {
+                    "wallpaper_style" if is_wallpaper_style(v) => {
                         p.wallpaper_style = v.to_string();
                         wallpaper_style_configured = true;
                     }
@@ -387,6 +403,9 @@ impl Prefs {
         let mut off: Vec<&str> = self.shields_off.iter().map(|s| s.as_str()).collect();
         off.sort();
         let b = |v: bool| if v { "1" } else { "0" };
+        let mut hidden_top_sites: Vec<&str> =
+            self.hidden_top_sites.iter().map(String::as_str).collect();
+        hidden_top_sites.sort_unstable();
         write_lines(
             "prefs.conf",
             &[
@@ -394,6 +413,9 @@ impl Prefs {
                 format!("block_cookies={}", b(self.block_cookies)),
                 format!("bookmarks_bar={}", b(self.bookmarks_bar)),
                 format!("search_engine={}", self.search_engine),
+                format!("theme={}", self.theme),
+                format!("show_top_sites={}", b(self.show_top_sites)),
+                format!("hidden_top_sites={}", hidden_top_sites.join(",")),
                 format!("background_images={}", b(self.background_images)),
                 format!("wallpaper_style={}", self.wallpaper_style),
                 format!("fingerprint_farbling={}", b(self.fingerprint_farbling)),
@@ -401,6 +423,44 @@ impl Prefs {
             ],
         );
     }
+}
+
+fn is_browser_theme(theme: &str) -> bool {
+    matches!(
+        theme,
+        "dark" | "light" | "midnight" | "forest" | "ocean" | "warm"
+    )
+}
+
+fn is_wallpaper_style(style: &str) -> bool {
+    matches!(
+        style,
+        "default" | "custom" | "solid" | "gradient" | "aurora" | "sunset" | "ocean" | "forest"
+    )
+}
+
+fn apply_browser_theme(window: &impl IsA<gtk4::Widget>, theme: &str) {
+    for theme in ["dark", "light", "midnight", "forest", "ocean", "warm"] {
+        window.remove_css_class(&format!("theme-{theme}"));
+    }
+    if is_browser_theme(theme) {
+        window.add_css_class(&format!("theme-{theme}"));
+    }
+}
+
+fn is_valid_site_host(host: &str) -> bool {
+    host.parse::<std::net::Ipv6Addr>().is_ok()
+        || (!host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }))
 }
 
 fn effective_wallpaper_style(style: &str, has_custom_background: bool) -> &str {
@@ -527,13 +587,25 @@ const FILTER_LIST_UPDATED_FILE: &str = "updated-at";
 
 #[derive(Default)]
 struct FilterListDomains {
-    blocked: Vec<String>,
-    allowed: Vec<String>,
+    blocked: Vec<FilterDomainRule>,
+    allowed: Vec<FilterDomainRule>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FilterDomainRule {
+    host: String,
+    path: Option<String>,
+    include_domains: Vec<String>,
+    exclude_domains: Vec<String>,
+    resource_types: Vec<String>,
+    third_party: bool,
 }
 
 fn parse_filter_list_domains(contents: &str) -> FilterListDomains {
     let mut blocked = HashSet::new();
     let mut allowed = HashSet::new();
+    let mut disabled_blocked = HashSet::new();
+    let mut disabled_allowed = HashSet::new();
 
     for line in contents.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
@@ -545,22 +617,32 @@ fn parse_filter_list_domains(contents: &str) -> FilterListDomains {
         let (pattern, options) = pattern
             .split_once('$')
             .map_or((pattern, ""), |(pattern, options)| (pattern, options));
-        if options.split(',').any(|option| {
-            let option = option.trim();
-            option.starts_with("domain=")
-                || option.starts_with('~')
-                || option == "document"
-                || option == "popup"
-                || option == "badfilter"
-                || option.contains('=')
-        }) {
-            continue;
-        }
+        let is_badfilter = options
+            .split(',')
+            .map(str::trim)
+            .any(|option| option == "badfilter");
 
-        let Some(host) = pattern.strip_prefix("||") else {
+        let Some(pattern) = pattern.strip_prefix("||") else {
             continue;
         };
-        let host = host.strip_suffix('^').unwrap_or(host);
+        let Some(delimiter) = pattern.find(['/', '^']) else {
+            continue;
+        };
+        let host = &pattern[..delimiter];
+        let suffix = &pattern[delimiter..];
+        let path = if suffix == "^" {
+            None
+        } else if suffix.starts_with('/')
+            && suffix.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'/' | b'.' | b'_' | b'~' | b'%' | b'-')
+            })
+        {
+            Some(suffix.to_string())
+        } else {
+            continue;
+        };
+        let host_only = path.is_none();
         if host.is_empty()
             || !host.contains('.')
             || host.starts_with('.')
@@ -573,18 +655,143 @@ fn parse_filter_list_domains(contents: &str) -> FilterListDomains {
             continue;
         }
 
-        let host = host.to_ascii_lowercase();
-        if is_exception {
-            allowed.insert(host);
+        let mut rule = FilterDomainRule {
+            host: host.to_ascii_lowercase(),
+            path,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            resource_types: Vec::new(),
+            // Host-only rules can overmatch, so restrict those to third-party requests.
+            third_party: host_only,
+        };
+        let mut resource_type_seen = false;
+        let mut included_resource_types = HashSet::new();
+        let mut excluded_resource_types = HashSet::new();
+        let mut unsupported = false;
+        for option in options
+            .split(',')
+            .map(str::trim)
+            .filter(|option| !option.is_empty() && *option != "badfilter")
+        {
+            if let Some(domains) = option.strip_prefix("domain=") {
+                for domain in domains.split('|') {
+                    let (excluded, domain) = domain
+                        .strip_prefix('~')
+                        .map_or((false, domain), |domain| (true, domain));
+                    if !is_valid_filter_domain(domain) {
+                        unsupported = true;
+                        break;
+                    }
+                    let destination = if excluded {
+                        &mut rule.exclude_domains
+                    } else {
+                        &mut rule.include_domains
+                    };
+                    destination.push(domain.to_ascii_lowercase());
+                }
+            } else if option == "third-party" {
+                rule.third_party = true;
+            } else if option == "~third-party" {
+                rule.third_party = false;
+            } else if let Some((resource_type, excluded)) = filter_resource_type(option) {
+                resource_type_seen = true;
+                if excluded {
+                    excluded_resource_types.insert(resource_type);
+                } else {
+                    included_resource_types.insert(resource_type);
+                }
+            } else if option == "match-case" {
+                continue;
+            } else {
+                unsupported = true;
+                break;
+            }
+        }
+        if unsupported {
+            continue;
+        }
+        if !rule.include_domains.is_empty() && !rule.exclude_domains.is_empty() {
+            continue;
+        }
+        if resource_type_seen {
+            let supported_types = [
+                "document",
+                "image",
+                "style-sheet",
+                "script",
+                "font",
+                "media",
+                "raw",
+            ];
+            rule.resource_types = if included_resource_types.is_empty() {
+                supported_types
+                    .into_iter()
+                    .filter(|kind| !excluded_resource_types.contains(kind))
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                included_resource_types
+                    .into_iter()
+                    .filter(|kind| !excluded_resource_types.contains(kind))
+                    .map(str::to_string)
+                    .collect()
+            };
+            if rule.resource_types.is_empty() {
+                continue;
+            }
+        }
+        rule.include_domains.sort_unstable();
+        rule.include_domains.dedup();
+        rule.exclude_domains.sort_unstable();
+        rule.exclude_domains.dedup();
+        rule.resource_types.sort_unstable();
+        if is_badfilter {
+            if is_exception {
+                disabled_allowed.insert(rule);
+            } else {
+                disabled_blocked.insert(rule);
+            }
+        } else if is_exception {
+            allowed.insert(rule);
         } else {
-            blocked.insert(host);
+            blocked.insert(rule);
         }
     }
+    blocked.retain(|rule| !disabled_blocked.contains(rule));
+    allowed.retain(|rule| !disabled_allowed.contains(rule));
 
     FilterListDomains {
         blocked: blocked.into_iter().collect(),
         allowed: allowed.into_iter().collect(),
     }
+}
+
+fn is_valid_filter_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+fn filter_resource_type(option: &str) -> Option<(&'static str, bool)> {
+    let (name, excluded) = option
+        .strip_prefix('~')
+        .map_or((option, false), |name| (name, true));
+    let webkit_type = match name {
+        "document" => "document",
+        "image" => "image",
+        "stylesheet" => "style-sheet",
+        "script" => "script",
+        "font" => "font",
+        "media" => "media",
+        "xmlhttprequest" => "raw",
+        _ => return None,
+    };
+    Some((webkit_type, excluded))
 }
 
 fn cached_filter_lists(cache_dir: &Path) -> Option<FilterListDomains> {
@@ -598,9 +805,39 @@ fn cached_filter_lists(cache_dir: &Path) -> Option<FilterListDomains> {
         combined.blocked.extend(parsed.blocked);
         combined.allowed.extend(parsed.allowed);
     }
-    combined.blocked.sort_unstable();
+    combined.blocked.sort_by(|a, b| {
+        (
+            &a.host,
+            &a.path,
+            &a.include_domains,
+            &a.exclude_domains,
+            &a.resource_types,
+        )
+            .cmp(&(
+                &b.host,
+                &b.path,
+                &b.include_domains,
+                &b.exclude_domains,
+                &b.resource_types,
+            ))
+    });
     combined.blocked.dedup();
-    combined.allowed.sort_unstable();
+    combined.allowed.sort_by(|a, b| {
+        (
+            &a.host,
+            &a.path,
+            &a.include_domains,
+            &a.exclude_domains,
+            &a.resource_types,
+        )
+            .cmp(&(
+                &b.host,
+                &b.path,
+                &b.include_domains,
+                &b.exclude_domains,
+                &b.resource_types,
+            ))
+    });
     combined.allowed.dedup();
     Some(combined)
 }
@@ -679,35 +916,82 @@ fn refresh_filter_lists(cache_dir: &Path) -> Result<FilterListDomains, String> {
     }
 }
 
-/// WebKit rules for known third-party ad/tracker domains and site-specific ad elements.
-fn filter_rules_json_with_lists(lists: &FilterListDomains) -> String {
-    let mut rules: Vec<serde_json::Value> = TRACKER_DOMAINS
-        .iter()
-        .copied()
-        .chain(lists.blocked.iter().map(String::as_str))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .map(|d| {
-            let domain_pattern = d.replace('.', r"\.");
-            serde_json::json!({
-                "trigger": {
-                    "url-filter": format!(r"^https?://([^/]+\.)?{}[:/]", domain_pattern),
-                    "load-type": ["third-party"]
-                },
-                "action": {"type": "block"}
-            })
-        })
-        .collect();
-    for domain in &lists.allowed {
-        let domain_pattern = domain.replace('.', r"\.");
-        rules.push(serde_json::json!({
-            "trigger": {
-                "url-filter": format!(r"^https?://([^/]+\.)?{}[:/]", domain_pattern),
-                "load-type": ["third-party"]
-            },
-            "action": {"type": "ignore-previous-rules"}
-        }));
+const MAX_RULES_PER_FILTER: usize = 8_000;
+
+fn webkit_filter_rule(rule: &FilterDomainRule, action: &str) -> serde_json::Value {
+    let domain_pattern = rule.host.replace('.', r"\.");
+    let url_filter = rule.path.as_ref().map_or_else(
+        || format!(r"^https?://([^/]+\.)?{}[:/]", domain_pattern),
+        |path| {
+            format!(
+                r"^https?://([^/]+\.)?{}{}",
+                domain_pattern,
+                path.replace('.', r"\.")
+            )
+        },
+    );
+    let mut trigger = serde_json::Map::from_iter([
+        (
+            "url-filter".to_string(),
+            serde_json::Value::String(url_filter),
+        ),
+        (
+            "load-type".to_string(),
+            serde_json::json!([if rule.third_party {
+                "third-party"
+            } else {
+                "first-party"
+            }]),
+        ),
+    ]);
+    if !rule.include_domains.is_empty() {
+        trigger.insert(
+            "if-domain".to_string(),
+            serde_json::json!(rule.include_domains),
+        );
     }
+    if !rule.exclude_domains.is_empty() {
+        trigger.insert(
+            "unless-domain".to_string(),
+            serde_json::json!(rule.exclude_domains),
+        );
+    }
+    if !rule.resource_types.is_empty() {
+        trigger.insert(
+            "resource-type".to_string(),
+            serde_json::json!(rule.resource_types),
+        );
+    }
+    serde_json::json!({
+        "trigger": trigger,
+        "action": {"type": action}
+    })
+}
+
+fn filter_rules(lists: &FilterListDomains) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut blocked = Vec::new();
+    let mut allowed = Vec::new();
+    for domain in TRACKER_DOMAINS {
+        let rule = FilterDomainRule {
+            host: (*domain).to_string(),
+            path: None,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            resource_types: Vec::new(),
+            third_party: true,
+        };
+        blocked.push(webkit_filter_rule(&rule, "block"));
+    }
+    for rule in &lists.blocked {
+        blocked.push(webkit_filter_rule(rule, "block"));
+    }
+    for rule in &lists.allowed {
+        allowed.push(webkit_filter_rule(rule, "ignore-previous-rules"));
+    }
+    (blocked, allowed)
+}
+
+fn append_cosmetic_filter_rules(rules: &mut Vec<serde_json::Value>) {
     rules.push(serde_json::json!({
         "trigger": {
             "url-filter": r"^https?://(www\.)?youtube(-nocookie)?\.com/",
@@ -728,6 +1012,45 @@ fn filter_rules_json_with_lists(lists: &FilterListDomains) -> String {
             "selector": ".results--ads, #ads, [data-testid='ad'], .js-sidebar-promo"
         }
     }));
+}
+
+fn filter_rules_json_batches(lists: &FilterListDomains) -> Result<Vec<String>, String> {
+    let mut batches = Vec::new();
+    let (blocked, allowed) = filter_rules(lists);
+    if allowed.len() + 2 > MAX_RULES_PER_FILTER
+        || (!blocked.is_empty() && allowed.len() + 2 == MAX_RULES_PER_FILTER)
+    {
+        return Err("exception rules leave no room for a valid Shields rule batch".to_string());
+    }
+    let block_batch_size = MAX_RULES_PER_FILTER - allowed.len() - 2;
+    if !blocked.is_empty() {
+        for (index, block_batch) in blocked.chunks(block_batch_size).enumerate() {
+            let mut batch = block_batch.to_vec();
+            batch.extend(allowed.iter().cloned());
+            if index == 0 {
+                append_cosmetic_filter_rules(&mut batch);
+            }
+            batches.push(
+                serde_json::to_string(&batch)
+                    .expect("serializing content blocker rules cannot fail"),
+            );
+        }
+    }
+    if batches.is_empty() {
+        let mut batch = allowed;
+        append_cosmetic_filter_rules(&mut batch);
+        batches.push(
+            serde_json::to_string(&batch).expect("serializing content blocker rules cannot fail"),
+        );
+    }
+    Ok(batches)
+}
+
+#[cfg(test)]
+fn filter_rules_json_with_lists(lists: &FilterListDomains) -> String {
+    let (mut rules, allowed) = filter_rules(lists);
+    rules.extend(allowed);
+    append_cosmetic_filter_rules(&mut rules);
     serde_json::to_string(&rules).expect("serializing content blocker rules cannot fail")
 }
 
@@ -736,6 +1059,10 @@ fn host_of(uri: &str) -> Option<String> {
         .ok()
         .and_then(|u| u.host())
         .map(|h| h.to_string())
+}
+
+fn is_web_uri(uri: &str) -> bool {
+    uri.starts_with("http://") || uri.starts_with("https://")
 }
 
 fn is_local_host(h: &str) -> bool {
@@ -760,6 +1087,20 @@ fn esc(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn load_error_html(uri: &str, error: &str) -> String {
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Page could not load</title><style>
+        *{{box-sizing:border-box}} body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#171416;color:#f4eeee;font:15px system-ui,sans-serif}}
+        main{{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #493632;border-radius:16px;background:#211b1b}}
+        h1{{margin:0 0 12px;font-size:22px}} p{{color:#c3b6b3;line-height:1.55;overflow-wrap:anywhere}}
+        code{{color:#f0d7d1}} a{{display:inline-block;margin-top:12px;padding:9px 16px;border-radius:9px;background:#b84b3a;color:white;text-decoration:none}}
+        </style></head><body><main><h1>This page couldn't be loaded</h1><p><code>{}</code></p><p>{}</p><a href="{}">Try again</a></main></body></html>"#,
+        esc(uri),
+        esc(error),
+        esc(uri)
+    )
 }
 
 fn format_history_date(timestamp: i64, format: &str) -> String {
@@ -839,6 +1180,91 @@ fn history_site_icon_html(favicon_url: &str) -> String {
     )
 }
 
+fn new_tab_top_sites(
+    bookmarks: &[Bookmark],
+    history: &[HistoryItem],
+    hidden_hosts: &HashSet<String>,
+) -> Vec<Bookmark> {
+    let mut sites = Vec::new();
+    let mut seen_hosts = HashSet::new();
+    for bookmark in bookmarks {
+        if !(bookmark.url.starts_with("http://") || bookmark.url.starts_with("https://")) {
+            continue;
+        }
+        let Some(host) = host_of(&bookmark.url) else {
+            continue;
+        };
+        let host = host.to_ascii_lowercase();
+        if !hidden_hosts.contains(&host) && seen_hosts.insert(host) {
+            sites.push(bookmark.clone());
+        }
+        if sites.len() == 8 {
+            return sites;
+        }
+    }
+
+    let mut visits: HashMap<String, (usize, i64, String, String)> = HashMap::new();
+    for item in history {
+        if !(item.url.starts_with("http://") || item.url.starts_with("https://")) {
+            continue;
+        }
+        let Some(host) = host_of(&item.url) else {
+            continue;
+        };
+        let key = host.to_ascii_lowercase();
+        if hidden_hosts.contains(&key) {
+            continue;
+        }
+        let visit = visits
+            .entry(key)
+            .or_insert_with(|| (0, item.time, item.title.clone(), item.url.clone()));
+        visit.0 += 1;
+        if item.time >= visit.1 {
+            visit.1 = item.time;
+            visit.2.clone_from(&item.title);
+            visit.3.clone_from(&item.url);
+        }
+    }
+    let mut ranked: Vec<_> = visits.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| b.1.1.cmp(&a.1.1)));
+    for (host, (_, _, title, url)) in ranked {
+        if seen_hosts.insert(host.clone()) {
+            sites.push(Bookmark {
+                title: if title.trim().is_empty() { host } else { title },
+                url,
+            });
+        }
+        if sites.len() == 8 {
+            break;
+        }
+    }
+    sites
+}
+
+fn new_tab_top_site_html(site: &Bookmark) -> String {
+    let host = host_of(&site.url).unwrap_or_default().to_ascii_lowercase();
+    let title = if site.title.trim().is_empty() {
+        if host.is_empty() {
+            site.url.clone()
+        } else {
+            host.clone()
+        }
+    } else {
+        site.title.clone()
+    };
+    let initial = title.chars().next().unwrap_or('?').to_uppercase();
+    format!(
+        r#"<div class="tile-wrap"><a class="tile" href="{}" title="{}"><div class="ic"><span class="tile-initial">{}</span><img alt="" src="{}" referrerpolicy="no-referrer" onload="this.previousElementSibling.hidden=true" onerror="this.hidden=true"></div><span>{}</span></a><button type="button" class="tile-hide" data-host="{}" aria-label="Hide {}" title="Hide site">×</button></div>"#,
+        esc(&site.url),
+        esc(&title),
+        esc(&initial.to_string()),
+        esc(&history_favicon_src(&site.url)),
+        esc(&title),
+        esc(&host),
+        esc(&host),
+    )
+}
+
 fn search_url(engine: &str) -> &'static str {
     match engine {
         "google" => "https://www.google.com/search?q=",
@@ -873,6 +1299,20 @@ fn normalize_input(input: &str, engine: &str) -> String {
     }
     if t.starts_with("localhost") || t.starts_with("127.0.0.1") {
         return format!("http://{t}");
+    }
+    if !t.contains(' ')
+        && let Some(host) = t.split(['/', '?', '#']).next()
+        && host.eq_ignore_ascii_case("youtube.com")
+    {
+        let suffix = &t[host.len()..];
+        let suffix = if suffix.is_empty() {
+            "/".to_string()
+        } else if suffix.starts_with('/') {
+            suffix.to_string()
+        } else {
+            format!("/{suffix}")
+        };
+        return format!("https://www.youtube.com{suffix}");
     }
     if !t.contains(' ') && t.contains('.') {
         return format!("https://{t}");
@@ -928,17 +1368,17 @@ const CSS: &str = r#"
    the content area is lighter than the chrome so pages feel lifted.
    Every rule below is built from these, so a different wallpaper only
    has to swap this block. */
-@define-color shell #16161a;          /* tab strip / outer shell      */
-@define-color chrome #202027;         /* toolbar surface              */
-@define-color surface #2a2a33;        /* raised: active tab, menus    */
-@define-color surface_hi #34343f;     /* hover on raised surfaces     */
-@define-color canvas #0e0e11;         /* behind page content          */
+@define-color shell #241512;          /* tab strip / outer shell      */
+@define-color chrome #59342e;         /* toolbar surface              */
+@define-color surface #51302a;        /* raised: active tab, menus    */
+@define-color surface_hi #684039;     /* hover on raised surfaces     */
+@define-color canvas #0d0d10;         /* behind page content          */
 @define-color window_bg @shell;
 @define-color window_bg_color @shell;
 
-@define-color fg #ececf1;
-@define-color fg_dim #9a9aa8;
-@define-color fg_mute #6b6b7a;
+@define-color fg #f0f0f2;
+@define-color fg_dim #a4a4ad;
+@define-color fg_mute #777780;
 
 @define-color accent_color #ff6a4d;
 @define-color accent_rgb rgb(255, 106, 77);
@@ -955,11 +1395,11 @@ const CSS: &str = r#"
 @define-color success #48c78e;
 @define-color warning #ffc107;
 
-/* The address bar is the one bright surface in the chrome. */
-@define-color field #ffffff;
-@define-color field_border transparent;
-@define-color field_fg #17171c;
-@define-color field_mute #6b7280;
+/* Keep the address field subtly lifted from the warm toolbar surface. */
+@define-color field #241b1b;
+@define-color field_border #b65b48;
+@define-color field_fg #f2e9e7;
+@define-color field_mute #a99a97;
 
 window, window.background { background-color: @window_bg; color: @fg; }
 
@@ -976,8 +1416,8 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
    raised surface, which is exactly how Brave/Chrome signal "selected". */
 .tabbar {
     background: @shell;
-    padding: 0 8px;
-    min-height: 40px;
+    padding: 0 6px;
+    min-height: 38px;
 }
 /* A WindowHandle adds its own padding; drop it so the strip sits flush. */
 .tabbar-handle { padding: 0; margin: 0; }
@@ -1007,9 +1447,9 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
 
 .browser-tab {
     background: transparent; color: @fg_dim;
-    border: none; border-radius: 8px;
+    border: none; border-radius: 8px 8px 5px 5px;
     padding: 0 4px 0 8px; margin: 0 1px;
-    min-height: 32px;
+    min-height: 30px;
     /* Bounded width: without a cap a single tab stretched across the whole
        strip and squeezed its own label. GTK CSS has no max-width, so the
        upper bound is applied as a size request in Rust. */
@@ -1020,9 +1460,9 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
 .browser-tab:hover { background: @hover; color: @fg; }
 .browser-tab.active {
     background: @surface; color: @fg;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.45);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
 }
-.browser-tab.active label { font-weight: 600; }
+.browser-tab.active label { font-weight: 400; }
 .browser-tab:focus-visible { outline: 1px solid @accent_color; }
 
 .browser-tab button {
@@ -1038,7 +1478,8 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
 /* ── Toolbar ──────────────────────────────────────────────────── */
 .toolbar-row {
     background: @chrome;
-    padding: 6px 10px;
+    padding: 3px 8px;
+    min-height: 38px;
     border-bottom: 1px solid @hairline;
 }
 /* A plain box still inherits Adwaita's background-image/box-shadow, which
@@ -1050,7 +1491,7 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
 .toolbar-group > button, .toolbar-group > menubutton { margin: 0 1px; }
 .toolbar-row button, .toolbar-row menubutton > button {
     background: transparent; color: @fg; border: none; border-radius: 7px;
-    min-width: 32px; min-height: 32px; padding: 0;
+    min-width: 30px; min-height: 30px; padding: 0;
     outline: none;
     transition: background 120ms ease, color 120ms ease, opacity 120ms ease;
 }
@@ -1068,24 +1509,22 @@ window.csd > decoration { border: none; box-shadow: none; margin: 0; padding: 0;
 .toolbar-row button:focus-visible,
 .toolbar-row menubutton > button:focus-visible { outline: 1px solid @accent_color; }
 
-/* ── Address bar ────────────────────────────────────────────────
-   White pill, no border, no outer ring: the shape and contrast do the
-   work. Focus only lifts it very slightly, so typing never produces the
-   stacked double-outline look. */
+/* ── Address bar ──────────────────────────────────────────────── */
 entry.url-entry {
     background: @field; color: @field_fg; caret-color: @accent_color;
-    border: none; border-radius: 999px;
-    padding: 0 16px; min-height: 32px;
+    border: 1px solid @field_border; border-radius: 10px;
+    padding: 0 12px; min-height: 32px;
     margin: 0 4px;
     outline: none;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.25);
-    transition: box-shadow 120ms ease, background 120ms ease;
+    box-shadow: none;
+    transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
 }
-entry.url-entry:hover { background: #f7f8fa; }
+entry.url-entry:hover { background: shade(@field, 1.08); }
 entry.url-entry:focus, entry.url-entry:focus-within {
-    background: #ffffff;
+    background: @field;
     outline: none;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.38);
+    border-color: @accent_color;
+    box-shadow: 0 0 0 1px @accent_color;
 }
 entry.url-entry image { color: @field_mute; margin-right: 8px; }
 entry.url-entry text { background: transparent; color: @field_fg; }
@@ -1150,6 +1589,61 @@ popover modelbutton, popover button.flat {
 }
 popover modelbutton:hover, popover button.flat:hover { background: @hover; }
 
+/* Keep the arrow/container transparent; draw the surface only around items. */
+popover.menu {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
+popover.menu > contents {
+    background: @popover_bg;
+    color: @fg;
+    border: 1px solid @hairline_strong;
+    border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0,0,0,0.62);
+    padding: 7px;
+}
+popover.menu modelbutton {
+    min-height: 34px;
+    padding: 5px 10px;
+    border-radius: 8px;
+    color: @fg;
+}
+popover.menu modelbutton:hover,
+popover.menu modelbutton:focus { background: @hover; }
+popover.menu modelbutton:active { background: @press; }
+popover.menu modelbutton accelerator { color: @fg_dim; }
+popover.menu separator { margin: 4px 2px; background: @hairline_strong; }
+
+.tab-list-item {
+    background: transparent;
+    background-image: none;
+    color: @fg_dim;
+    border: none;
+    border-radius: 8px;
+    box-shadow: none;
+    min-height: 32px;
+    padding: 6px 10px;
+}
+.tab-list-item:hover { background: @hover; color: @fg; }
+
+tooltip, tooltip.background {
+    background: @popover_bg;
+    color: @fg;
+    border: 1px solid @hairline_strong;
+    border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0,0,0,0.62);
+    padding: 7px;
+}
+tooltip label { color: @fg; padding: 4px 7px; font-size: 11px; }
+window.theme-light tooltip,
+window.theme-light tooltip.background {
+    background: #ffffff;
+    color: #252630;
+    border-color: #d7d9e0;
+}
+window.theme-light tooltip label { color: #252630; }
+
 switch { border-radius: 999px; }
 switch:checked { background: @accent_color; }
 switch slider { border-radius: 999px; }
@@ -1182,6 +1676,95 @@ dialog button.suggested-action:hover, window.dialog button.suggested-action:hove
 .badge.success { background: @success; color: #0b1a13; }
 .badge.danger { background: @danger; color: #fff; }
 
+/* ── Browser themes ──────────────────────────────────────────── */
+window.theme-light { background-color: #f3f4f7; color: #252630; }
+window.theme-light .tabbar { background: #e6e8ed; }
+window.theme-light .toolbar-row,
+window.theme-light .bookmarks-bar,
+window.theme-light .find-bar { background: #f3f4f7; color: #252630; }
+window.theme-light .tabbar button.tabbar-button,
+window.theme-light .tabbar button.tabbar-close,
+window.theme-light .toolbar-row button,
+window.theme-light .toolbar-row menubutton > button { color: #4a4b56; }
+window.theme-light .tabbar button:hover,
+window.theme-light .toolbar-row button:hover,
+window.theme-light .toolbar-row menubutton > button:hover,
+window.theme-light .bookmarks-bar button:hover { background: rgba(25,27,36,0.08); color: #20212a; }
+window.theme-light .browser-tab { color: #494a55; }
+window.theme-light .browser-tab.active { background: #ffffff; }
+window.theme-light .browser-tab.active label { color: #20212a; }
+window.theme-light entry.url-entry {
+    background: #ffffff; color: #252630; border-color: #d7d9e0;
+}
+window.theme-light entry.url-entry text { color: #252630; }
+window.theme-light entry.url-entry text placeholder { color: #777b89; }
+window.theme-light entry.url-entry:focus,
+window.theme-light entry.url-entry:focus-within { border-color: @accent_color; }
+window.theme-light .browser-tab button { color: #555762; }
+window.theme-light .bookmarks-bar button { color: #50515c; }
+window.theme-light .find-bar entry,
+window.theme-light .find-bar searchentry { background: #ffffff; color: #252630; }
+window.theme-light popover.background,
+window.theme-light popover > contents { background: #ffffff; color: #252630; border-color: #d7d9e0; }
+window.theme-light popover label { color: #252630; }
+window.theme-light popover label.dim-label { color: #626470; }
+window.theme-light scrollbar slider { background: rgba(20,22,30,0.22); }
+window.theme-light progressbar.load-progress progress {
+    background: linear-gradient(90deg, #e35c43, #f08a66);
+}
+
+window.theme-midnight { background-color: #171522; }
+window.theme-midnight .tabbar { background: #171522; }
+window.theme-midnight .toolbar-row,
+window.theme-midnight .bookmarks-bar,
+window.theme-midnight .find-bar { background: #211e30; }
+window.theme-midnight .browser-tab.active { background: #332b4b; }
+window.theme-midnight .toolbar-row button:focus-visible,
+window.theme-midnight .toolbar-row menubutton > button:focus-visible { outline-color: #a38bff; }
+window.theme-midnight .find-bar entry:focus-within { box-shadow: inset 0 0 0 1px #a38bff; }
+window.theme-midnight progressbar.load-progress progress {
+    background: linear-gradient(90deg, #8b70e8, #b5a0ff);
+}
+
+window.theme-forest { background-color: #111a17; }
+window.theme-forest .tabbar { background: #111a17; }
+window.theme-forest .toolbar-row,
+window.theme-forest .bookmarks-bar,
+window.theme-forest .find-bar { background: #192720; }
+window.theme-forest .browser-tab.active { background: #263b30; }
+window.theme-forest .toolbar-row button:focus-visible,
+window.theme-forest .toolbar-row menubutton > button:focus-visible { outline-color: #70c497; }
+window.theme-forest .find-bar entry:focus-within { box-shadow: inset 0 0 0 1px #70c497; }
+window.theme-forest progressbar.load-progress progress {
+    background: linear-gradient(90deg, #42966c, #79c99d);
+}
+
+window.theme-ocean { background-color: #111923; }
+window.theme-ocean .tabbar { background: #111923; }
+window.theme-ocean .toolbar-row,
+window.theme-ocean .bookmarks-bar,
+window.theme-ocean .find-bar { background: #192633; }
+window.theme-ocean .browser-tab.active { background: #24394b; }
+window.theme-ocean .toolbar-row button:focus-visible,
+window.theme-ocean .toolbar-row menubutton > button:focus-visible { outline-color: #6bb8df; }
+window.theme-ocean .find-bar entry:focus-within { box-shadow: inset 0 0 0 1px #6bb8df; }
+window.theme-ocean progressbar.load-progress progress {
+    background: linear-gradient(90deg, #3589b5, #72c4e7);
+}
+
+window.theme-warm { background-color: #1c1513; }
+window.theme-warm .tabbar { background: #1c1513; }
+window.theme-warm .toolbar-row,
+window.theme-warm .bookmarks-bar,
+window.theme-warm .find-bar { background: #2a1e19; }
+window.theme-warm .browser-tab.active { background: #403027; }
+window.theme-warm .toolbar-row button:focus-visible,
+window.theme-warm .toolbar-row menubutton > button:focus-visible { outline-color: #e6a36f; }
+window.theme-warm .find-bar entry:focus-within { box-shadow: inset 0 0 0 1px #e6a36f; }
+window.theme-warm progressbar.load-progress progress {
+    background: linear-gradient(90deg, #bd7048, #e6aa73);
+}
+
 /* ── Private window ────────────────────────────────────────────
    Same ramp, shifted into violet, so the geometry and contrast stay
    identical to the normal window and only the hue changes. */
@@ -1213,6 +1796,7 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   html, body { margin: 0; width: 100%; min-height: 100vh; height: 100%;
                color: #fff; font-family: system-ui, sans-serif; overflow: hidden;
                background-color: #14111a; background-repeat: no-repeat; }
+  body { --wallpaper-accent: #ff6a4d; --wallpaper-accent-rgb: 255,106,77; --wallpaper-surface-rgb: 82,61,57; }
   body { background:
            linear-gradient(180deg, rgba(0,0,0,.50), rgba(0,0,0,.08) 42%, rgba(0,0,0,.62)),
            var(--wallpaper) center 53% / cover no-repeat,
@@ -1221,35 +1805,66 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   body.no-background { background: #171214; }
   body.wallpaper-solid { background: radial-gradient(ellipse at 50% 28%, rgba(84,105,255,.2), transparent 55%), linear-gradient(145deg, #10182f, #17132a 58%, #24151d); }
   body.wallpaper-gradient { background: radial-gradient(ellipse at 18% 18%, rgba(255,136,104,.34), transparent 36%), radial-gradient(ellipse at 82% 78%, rgba(130,74,255,.34), transparent 42%), linear-gradient(135deg, #1b1420, #241426 55%, #101a2d); }
+  body.wallpaper-aurora { background: radial-gradient(ellipse at 20% 20%, rgba(81,230,196,.35), transparent 38%), radial-gradient(ellipse at 82% 72%, rgba(105,93,255,.38), transparent 45%), linear-gradient(140deg, #0d1d24, #152238 55%, #211a35); }
+  body.wallpaper-sunset { background: radial-gradient(ellipse at 72% 18%, rgba(255,183,94,.42), transparent 38%), radial-gradient(ellipse at 18% 78%, rgba(237,83,115,.35), transparent 45%), linear-gradient(140deg, #321a28, #54283a 55%, #20203a); }
+  body.wallpaper-ocean { background: radial-gradient(ellipse at 25% 28%, rgba(65,185,232,.35), transparent 42%), radial-gradient(ellipse at 82% 76%, rgba(45,103,194,.36), transparent 45%), linear-gradient(140deg, #102436, #153d56 55%, #111d37); }
+  body.wallpaper-forest { background: radial-gradient(ellipse at 22% 25%, rgba(117,207,132,.3), transparent 40%), radial-gradient(ellipse at 80% 78%, rgba(48,143,113,.35), transparent 45%), linear-gradient(140deg, #13251c, #1c3c2b 55%, #102b30); }
+  body.theme-light { color: #242632; background: linear-gradient(145deg, #f8f9fc, #e8ebf3); }
+  body.theme-light .mode, body.theme-light .tile { color: #292b36; text-shadow: none; }
+  body.theme-light #f { background: rgba(var(--wallpaper-accent-rgb),.10); border-color: rgba(55,58,72,.17); box-shadow: 0 10px 30px rgba(40,44,58,.12); }
+  body.theme-light #f:focus-within { background: rgba(var(--wallpaper-accent-rgb),.15); border-color: var(--wallpaper-accent); box-shadow: 0 10px 30px rgba(40,44,58,.16), 0 0 0 3px rgba(var(--wallpaper-accent-rgb),.2); }
+  body.theme-light #q { color: #242632; }
+  body.theme-light #q::placeholder { color: #777b89; }
+  body.theme-light .tile .ic { color: #373947; background: rgba(255,255,255,.76); border-color: rgba(40,44,58,.12); }
+  body.theme-midnight.no-background { background: radial-gradient(ellipse at 50% 15%, rgba(110,84,190,.25), transparent 55%), linear-gradient(145deg, #12111b, #1b1729 60%, #11141e); }
+  body.theme-forest.no-background { background: radial-gradient(ellipse at 50% 15%, rgba(63,142,101,.22), transparent 55%), linear-gradient(145deg, #111915, #17261f 60%, #101b20); }
+  body.theme-ocean.no-background { background: radial-gradient(ellipse at 50% 15%, rgba(58,145,192,.22), transparent 55%), linear-gradient(145deg, #101720, #152636 60%, #10151e); }
+  body.theme-warm.no-background { background: radial-gradient(ellipse at 50% 15%, rgba(190,112,72,.2), transparent 55%), linear-gradient(145deg, #171210, #2a1d17 60%, #171617); }
   .gear { position: absolute; top: 18px; right: 22px; width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(0,0,0,.22); cursor: pointer; }
   .gear:hover { background: rgba(255,255,255,.16); }
   .gear img { width: 16px; height: 16px; opacity: .95; }
-  /* Center the whole stack (search + heading + tiles) in the viewport instead
-     of pinning each piece to a fixed offset, which drifted on resize. */
+  /* Keep the search field and shortcuts centered horizontally near the top. */
   .stage { position: absolute; inset: 0; display: flex; flex-direction: column;
-           align-items: center; justify-content: center; gap: 14px; padding: 24px;
-           pointer-events: none; }
+           align-items: center; justify-content: flex-start; gap: 14px;
+           padding: 47px clamp(24px, 3.45vw, 48px) 24px; pointer-events: none; }
   .stage > * { pointer-events: auto; }
-  .mode { width: 100%; text-align: center; color: #e8e8ec; font-size: 12px;
+  .mode { width: min(420px, 100%); text-align: center; color: #e8e8ec; font-size: 12px;
           letter-spacing: .02em; text-shadow: 0 2px 10px #000; }
-  #f { width: min(560px, 100%); height: 52px; padding: 0 18px;
-       display: flex; align-items: center; gap: 12px;
-       background: rgba(22,22,24,.82); backdrop-filter: blur(14px);
-       border: 1px solid rgba(255,255,255,.16);
-       box-shadow: 0 10px 30px rgba(0,0,0,.38); border-radius: 999px;
-       transition: border-color .16s ease, box-shadow .16s ease; }
-  #f:focus-within { border-color: rgba(255,106,77,.75);
-                    box-shadow: 0 10px 30px rgba(0,0,0,.45), 0 0 0 3px rgba(255,106,77,.22); }
-  #f img { width: 20px; height: 20px; }
-  #q { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: #fff; font-size: 15px; }
-  #q::placeholder { color: #9d9da8; }
-  .tiles { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; max-width: 720px; margin-top: 10px; }
-  .tile { width: 84px; text-align: center; color: #fff; text-decoration: none; font-size: 12px; }
-  .tile .ic { width: 56px; height: 56px; margin: 0 auto 6px; border-radius: 16px; font-size: 24px;
-              background: rgba(22,22,24,.72); backdrop-filter: blur(12px);
+  #f { width: min(420px, 100%); height: 48px; padding: 0 14px;
+       display: flex; align-items: center; gap: 10px;
+       background: rgba(var(--wallpaper-surface-rgb),.92); backdrop-filter: blur(14px);
+       border: 1px solid rgba(255,255,255,.10);
+       box-shadow: 0 8px 26px rgba(0,0,0,.3); border-radius: 15px;
+       transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
+  #f:focus-within { border-color: var(--wallpaper-accent); background: rgba(var(--wallpaper-surface-rgb),.97);
+                    box-shadow: 0 8px 26px rgba(0,0,0,.34), 0 0 0 2px rgba(var(--wallpaper-accent-rgb),.2); }
+  #f img { width: 18px; height: 18px; object-fit: contain; }
+  #q { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: #f3efed; font-size: 14px; }
+  #q::placeholder { color: #aaa1a0; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; width: min(720px, 100%); margin-top: 10px; }
+  .tiles[hidden] { display: none; }
+  .tile-wrap { position: relative; width: 84px; }
+  .tile { display: block; width: 84px; text-align: center; color: #fff; text-decoration: none; font-size: 12px; }
+  .tile .ic { position: relative; width: 56px; height: 56px; margin: 0 auto 6px; border-radius: 16px; font-size: 24px;
+              background: rgba(var(--wallpaper-surface-rgb),.78); backdrop-filter: blur(12px);
               border: 1px solid rgba(255,255,255,.12);
               display: flex; align-items: center; justify-content: center;
               transition: background .16s ease, border-color .16s ease, transform .16s ease; }
+  .tile .ic img { position: absolute; width: 26px; height: 26px; object-fit: contain; border-radius: 6px; }
+  .tile .tile-initial { color: var(--wallpaper-accent); font-size: 20px; font-weight: 650; }
+  .tile-hide { position: absolute; top: -7px; right: 7px; display: grid; width: 23px; height: 23px; place-items: center;
+               padding: 0; color: #eee; font-size: 17px; line-height: 1; background: rgba(25,20,20,.94);
+               border: 1px solid rgba(255,255,255,.2); border-radius: 50%; opacity: 0; cursor: pointer;
+               transition: opacity .14s ease, background .14s ease, transform .14s ease; }
+  .tile-wrap:hover .tile-hide, .tile-hide:focus-visible { opacity: 1; }
+  .tile-hide:hover { background: #d54d3d; transform: scale(1.05); }
+  .tile-wrap.removing { opacity: 0; transform: scale(.9); transition: opacity .16s ease, transform .16s ease; }
+  @media (pointer: coarse) { .tile-hide { opacity: .85; } }
+  body.theme-light #f { background: rgba(var(--wallpaper-accent-rgb),.10); }
+  body.theme-light #q { color: #242632; }
+  body.theme-light #q::placeholder { color: #777b89; }
+  body.theme-ocean #f { background: rgba(var(--wallpaper-surface-rgb),.92); }
+  body.theme-warm #f { background: rgba(var(--wallpaper-surface-rgb),.92); }
   .tile:hover .ic { background: rgba(40,40,46,.9); border-color: rgba(255,255,255,.24);
                     transform: translateY(-2px); }
   .tile span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1263,11 +1878,12 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
                box-shadow: 0 24px 80px rgba(0,0,0,.58); }
   .customize.open { display: flex; }
   .side { flex: 0 0 220px; padding: 26px 12px; background: #191314; border-right: 1px solid rgba(255,255,255,.07); }
-  .side h1 { margin: 4px 14px 28px; color: #fff3f1; font-size: 18px; font-weight: 650; letter-spacing: .01em; }
-  .nav { position: relative; width: 100%; min-height: 44px; display: flex; align-items: center; gap: 14px; padding: 11px 14px; color: #c9bdbd; text-align: left; background: transparent; border: 0; border-radius: 10px; cursor: pointer; transition: background .16s ease, color .16s ease; }
+  .side h1 { margin: 4px 14px 28px; color: #f2e7e5; font-size: 17px; font-weight: 500; letter-spacing: .015em; }
+  .nav { position: relative; width: 100%; min-height: 44px; display: flex; align-items: center; gap: 12px; padding: 10px 14px; color: #c9bdbd; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 11px; cursor: pointer; transition: background .16s ease, color .16s ease, border-color .16s ease; }
   .nav:hover { color: #fff; background: rgba(255,255,255,.06); }
-  .nav.active { color: #ffb1a3; background: rgba(255,111,85,.13); }
+  .nav.active { color: #ffb1a3; background: rgba(255,111,85,.13); border-color: rgba(255,154,137,.12); }
   .nav.active::before { content: ""; position: absolute; top: 10px; bottom: 10px; left: 0; width: 3px; background: #ff9a89; border-radius: 0 3px 3px 0; }
+  .nav-icon { display: grid; flex: 0 0 24px; width: 24px; height: 24px; place-items: center; color: currentColor; font-size: 15px; opacity: .8; }
   .content { position: relative; flex: 1; min-width: 0; padding: 48px 40px; overflow: auto; }
   .close { position: absolute; top: 14px; right: 14px; display: grid; place-items: center; width: 34px; height: 34px; color: #cdbfbe; font-size: 22px; background: transparent; border: 0; border-radius: 9px; cursor: pointer; transition: background .16s ease, color .16s ease; }
   .close:hover { color: white; background: rgba(255,255,255,.09); }
@@ -1283,49 +1899,104 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   .toggle-switch input:checked + .switch-track::before { background: #fff7f5; transform: translateX(18px); }
   .toggle-switch:hover .switch-track { border-color: #ffad9d; }
   .toggle-switch input:focus-visible + .switch-track { outline: 2px solid #ffc0b4; outline-offset: 3px; }
-  .cards { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; padding: 18px; margin-top: 14px; background: #281f20; border: 1px solid rgba(255,255,255,.07); border-radius: 14px; }
-  .card { min-width: 0; padding: 7px; color: #d8cccb; text-align: center; background: transparent; border: 1px solid transparent; border-radius: 13px; cursor: pointer; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
-  .card:hover { background: rgba(255,255,255,.035); transform: translateY(-2px); }
-  .card.selected { background: rgba(255,111,85,.07); border-color: rgba(255,154,137,.42); }
+  .cards { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; padding: 12px; margin-top: 14px; background: rgba(255,255,255,.025); border: 1px solid rgba(255,255,255,.06); border-radius: 16px; }
+  .card { min-width: 0; padding: 7px; color: #d8cccb; text-align: center; background: #241b1c; border: 1px solid rgba(255,255,255,.055); border-radius: 13px; cursor: pointer; transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+  .card:hover { background: #2c2122; border-color: rgba(255,255,255,.14); transform: translateY(-2px); }
+  .card.selected { background: rgba(255,111,85,.09); border-color: rgba(255,154,137,.72); box-shadow: 0 0 0 1px rgba(255,154,137,.12), 0 8px 20px rgba(0,0,0,.16); }
   .card:focus-visible, .close:focus-visible { outline: 2px solid #ff9a89; outline-offset: 2px; }
   .nav:focus-visible { outline: 2px solid #ff9a89; outline-offset: 2px; z-index: 1; }
-  .preview { position: relative; display: block; width: 100%; height: clamp(100px, 20vh, 156px); overflow: hidden; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: #151112; }
-  .preview img { width: 100%; height: 100%; object-fit: cover; }
+  .preview { position: relative; display: block; width: 100%; height: clamp(88px, 16vh, 128px); overflow: hidden; border: 1px solid rgba(255,255,255,.13); border-radius: 9px; background: #151112; box-shadow: inset 0 1px 0 rgba(255,255,255,.05); }
+  .preview img { width: 100%; height: 100%; object-fit: cover; transition: transform .24s ease, filter .24s ease; }
+  .card:hover .preview img { transform: scale(1.035); }
   #choose-background:not(.selected) .preview img { display: none; }
   #choose-background:not(.selected) .preview::after { content: "+\A Choose an image"; white-space: pre; position: absolute; inset: 0; display: grid; align-content: center; justify-items: center; gap: 8px; color: #e6d4d1; font-size: 14px; background: linear-gradient(145deg,#2a2021,#1c1617); }
   #solid-background .preview { background: linear-gradient(145deg,#172744,#243e66); }
   #gradient-background .preview { background: linear-gradient(135deg,#ed765e 0%,#a64fa1 48%,#394f9d 100%); }
-  .preview .select-mark { position: absolute; right: 12px; bottom: 12px; display: none; place-items: center; width: 30px; height: 30px; color: transparent; font-size: 0; background: #ffaaa0; border: 3px solid #fff; border-radius: 50%; box-shadow: 0 3px 10px rgba(0,0,0,.38); }
+  #aurora-background .preview { background: radial-gradient(ellipse at 20% 20%,#51e6c4,transparent 55%),radial-gradient(ellipse at 82% 72%,#695dff,transparent 60%),linear-gradient(140deg,#0d1d24,#211a35); }
+  #sunset-background .preview { background: radial-gradient(ellipse at 72% 18%,#ffb75e,transparent 55%),radial-gradient(ellipse at 18% 78%,#ed5373,transparent 60%),linear-gradient(140deg,#321a28,#20203a); }
+  #ocean-background .preview { background: radial-gradient(ellipse at 25% 28%,#41b9e8,transparent 55%),radial-gradient(ellipse at 82% 76%,#2d67c2,transparent 60%),linear-gradient(140deg,#102436,#111d37); }
+  #forest-background .preview { background: radial-gradient(ellipse at 22% 25%,#75cf84,transparent 55%),radial-gradient(ellipse at 80% 78%,#308f71,transparent 60%),linear-gradient(140deg,#13251c,#102b30); }
+  .preview .select-mark { position: absolute; right: 10px; bottom: 10px; display: none; place-items: center; width: 26px; height: 26px; color: transparent; font-size: 0; background: #ff9786; border: 2px solid rgba(255,255,255,.94); border-radius: 50%; box-shadow: 0 3px 10px rgba(0,0,0,.38); }
   .preview .select-mark::after { content: ""; width: 7px; height: 12px; margin-top: -3px; border: solid #fff; border-width: 0 3px 3px 0; transform: rotate(45deg); }
   .card.selected .select-mark { display: grid; }
-  .card-label { display: block; padding: 8px 0 2px; font-size: 13px; font-weight: 550; }
+  .card-label { display: block; padding: 9px 2px 3px; font-size: 12px; font-weight: 600; letter-spacing: .01em; }
   .card:hover .preview, .card.selected .preview { border-color: rgba(255,154,137,.58); }
   .engine-heading { margin: 0 8px 12px; color: #d7c8c6; font-size: 13px; font-weight: 600; }
-  .engine-list { overflow: hidden; background: #211a1a; border: 1px solid rgba(255,255,255,.1); border-radius: 10px; }
-  .engine-option { display: flex; align-items: center; gap: 14px; min-height: 52px; padding: 8px 16px; color: #e7dcda; cursor: pointer; transition: background .15s ease; }
-  .engine-option + .engine-option { border-top: 1px solid rgba(255,255,255,.09); }
-  .engine-option:hover { background: rgba(255,255,255,.045); }
+  .engine-list { display: grid; gap: 8px; overflow: visible; }
+  .engine-option { display: flex; align-items: center; gap: 14px; min-height: 54px; padding: 9px 14px; color: #e7dcda; background: #281f20; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; cursor: pointer; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+  .engine-option:hover { background: #302526; border-color: rgba(255,255,255,.15); transform: translateY(-1px); }
+  .engine-option.selected { background: rgba(255,111,85,.08); border-color: rgba(255,154,137,.56); }
   .engine-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
   .engine-option:focus-within { outline: 2px solid #ff9a89; outline-offset: -2px; z-index: 1; }
   .engine-icon { display: block; flex: 0 0 24px; width: 24px; height: 24px; object-fit: contain; }
   .engine-name { flex: 1; color: #e2d7d5; font-size: 14px; font-weight: 450; }
-  .engine-check { display: grid; flex: 0 0 16px; width: 16px; height: 16px; place-items: center; border: 1.5px solid #aa9997; border-radius: 4px; transition: background .15s ease, border-color .15s ease; }
-  .engine-check::after { content: ""; width: 4px; height: 8px; margin-top: -2px; border: solid transparent; border-width: 0 2px 2px 0; transform: rotate(45deg); }
-  .engine-option.selected .engine-check { background: #ffab9d; border-color: #ffab9d; }
-  .engine-option.selected .engine-check::after { border-color: #372321; }
+  .engine-check { display: grid; flex: 0 0 18px; width: 18px; height: 18px; place-items: center; border: 1.5px solid #aa9997; border-radius: 50%; transition: background .15s ease, border-color .15s ease, box-shadow .15s ease; }
+  .engine-check::after { content: ""; width: 8px; height: 8px; background: transparent; border-radius: 50%; }
+  .engine-option.selected .engine-check { background: #ffab9d; border-color: #ffab9d; box-shadow: inset 0 0 0 4px #281f20; }
+  .engine-option.selected .engine-check::after { display: none; }
   .hint { margin: 14px 4px; color: #b7aaaa; font-size: 13px; line-height: 1.5; }
+  .theme-description { margin: -10px 4px 16px; color: #b7aaaa; font-size: 13px; line-height: 1.5; }
+  .theme-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+  .theme-choice { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 9px; color: #e7dcda; text-align: left; background: #281f20; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease; }
+  .theme-choice:hover { background: #302526; border-color: rgba(255,255,255,.16); transform: translateY(-1px); }
+  .theme-choice.selected { border-color: rgba(255,154,137,.7); background: rgba(255,111,85,.09); box-shadow: 0 5px 16px rgba(0,0,0,.14); }
+  .theme-choice:focus-visible { outline: 2px solid #ff9a89; outline-offset: 2px; }
+  .theme-swatch { display: flex; flex: 0 0 72px; height: 48px; overflow: hidden; flex-direction: column; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; }
+  .theme-swatch::before { content: ""; height: 13px; background: var(--swatch-shell); }
+  .theme-swatch::after { content: ""; flex: 1; background: linear-gradient(90deg, var(--swatch-chrome) 0 68%, var(--swatch-accent) 68%); }
+  .theme-choice[data-theme="dark"] { --swatch-shell: #16161a; --swatch-chrome: #2a2a33; --swatch-accent: #ff6a4d; }
+  .theme-choice[data-theme="light"] { --swatch-shell: #e6e8ed; --swatch-chrome: #fff; --swatch-accent: #e35c43; }
+  .theme-choice[data-theme="midnight"] { --swatch-shell: #171522; --swatch-chrome: #332b4b; --swatch-accent: #a38bff; }
+  .theme-choice[data-theme="forest"] { --swatch-shell: #111a17; --swatch-chrome: #263b30; --swatch-accent: #70c497; }
+  .theme-choice[data-theme="ocean"] { --swatch-shell: #111923; --swatch-chrome: #24394b; --swatch-accent: #6bb8df; }
+  .theme-choice[data-theme="warm"] { --swatch-shell: #1c1513; --swatch-chrome: #403027; --swatch-accent: #e6a36f; }
+  .theme-choice-label { flex: 1; font-size: 13px; font-weight: 550; }
+  .theme-choice-check { display: grid; flex: 0 0 18px; width: 18px; height: 18px; place-items: center; border: 1px solid #8e7d7b; border-radius: 50%; color: transparent; font-size: 12px; }
+  .theme-choice.selected .theme-choice-check { color: #21191a; background: #ffaaa0; border-color: #ffaaa0; }
+  .restore-sites { margin-top: 14px; padding: 10px 14px; color: #f0e7e6; background: #302526; border: 1px solid rgba(255,255,255,.1); border-radius: 9px; cursor: pointer; }
+  .restore-sites:hover:not(:disabled) { background: #3a2a2b; border-color: rgba(255,154,137,.42); }
+  .restore-sites:disabled { opacity: .48; cursor: default; }
+  body.theme-light .customize { color: #252630; background: #f7f8fb; border-color: rgba(35,38,48,.12); }
+  body.theme-light .side { background: #eef0f5; border-color: rgba(35,38,48,.08); }
+  body.theme-light .side h1, body.theme-light .panel h2 { color: #252630; }
+  body.theme-light .nav { color: #5a5c68; }
+  body.theme-light .nav:hover { color: #252630; background: rgba(35,38,48,.06); }
+  body.theme-light .nav.active { color: #a53e2d; background: rgba(227,92,67,.11); }
+  body.theme-light .toggle-row, body.theme-light .cards,
+  body.theme-light .theme-choice { color: #30323d; background: #fff; border-color: rgba(35,38,48,.1); }
+  body.theme-light .card { color: #444652; background: #fff; border-color: rgba(35,38,48,.1); }
+  body.theme-light .card:hover { background: #fbf8f7; border-color: rgba(35,38,48,.2); }
+  body.theme-light .card.selected { background: rgba(227,92,67,.055); border-color: #e87968; }
+  body.theme-light .restore-sites { color: #30323d; background: #fff; border-color: rgba(35,38,48,.12); }
+  body.theme-light .theme-choice:hover { background: #f1f2f6; }
+  body.theme-light .theme-choice.selected { border-color: #e35c43; background: rgba(227,92,67,.07); }
+  body.theme-light .engine-heading, body.theme-light .engine-name { color: #30323d; }
+  body.theme-light .engine-option { background: #fff; border-color: rgba(35,38,48,.1); }
+  body.theme-light .engine-option:hover { background: #f7f7fa; }
+  body.theme-light .engine-option.selected { background: rgba(227,92,67,.055); border-color: rgba(227,92,67,.55); }
+  body.theme-light .engine-option.selected .engine-check { box-shadow: inset 0 0 0 4px #fff; }
+  body.theme-light .engine-option { color: #30323d; }
+  body.theme-light .hint, body.theme-light .theme-description { color: #646775; }
+  body.theme-light .close { color: #585a65; }
+  body.theme-light .close:hover { color: #252630; background: rgba(35,38,48,.07); }
+  body.theme-light .customize-backdrop { background: rgba(27,30,40,.28); }
   #wallpaper-file { display: none; }
   @media (max-width: 700px) {
     .customize { inset: 0; width: 100vw; height: 100vh; transform: none; border: 0; border-radius: 0; }
-    .side { display: none; }
+    .customize.open { flex-direction: column; }
+    .side { display: block; flex: 0 0 auto; padding: 12px 14px 8px; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+    .side h1 { margin: 0 4px 8px; font-size: 16px; }
+    .nav { display: inline-flex; width: auto; min-height: 36px; margin-right: 4px; padding: 8px 10px; gap: 7px; }
+    .nav-icon { flex-basis: 18px; width: 18px; height: 18px; }
+    .nav.active::before { top: auto; right: 10px; bottom: 0; left: 10px; width: auto; height: 2px; border-radius: 2px 2px 0 0; }
     .content { padding: 38px 32px 24px; }
     .panel { max-width: none; }
-    .preview { height: clamp(140px, 30vh, 180px); }
+    .preview { height: clamp(104px, 22vh, 148px); }
   }
   @media (max-width: 420px) {
     .content { padding-inline: 20px; }
     .cards { gap: 8px; padding: 10px; }
-    .preview { height: clamp(110px, 28vh, 150px); }
+    .preview { height: clamp(92px, 22vh, 132px); }
     .card-label { font-size: 12px; }
   }
   @media (max-height: 480px) { .customize { height: calc(100vh - 16px); } .content { padding-top: 24px; } }
@@ -1336,19 +2007,21 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
 </button>
 <main class="stage">
   <form id="f">
-    <img alt="" src="data:image/png;base64,{{LOGO}}">
-    <input id="q" placeholder="Search or enter an address..." autofocus autocomplete="off">
+    <img alt="Linus Browser" src="data:image/png;base64,{{LOGO}}">
+    <input id="q" placeholder="Ask anything, find anything..." autofocus autocomplete="off">
   </form>
   <div class="mode">{{HEADING}}</div>
-  <div class="tiles">{{TILES}}</div>
+  <div class="tiles" {{TOP_SITES_HIDDEN}}>{{TILES}}</div>
 </main>
 
 <div class="customize-backdrop" id="customize-backdrop"></div>
 <section class="customize" id="customize" role="dialog" aria-modal="true" aria-label="Customize new tab">
   <nav class="side">
     <h1>Customize</h1>
-    <button class="nav active" data-panel="background-panel">▧ <span>Background Image</span></button>
-    <button class="nav" data-panel="search-panel">⌕ <span>Search</span></button>
+    <button class="nav active" data-panel="background-panel"><span class="nav-icon" aria-hidden="true">▧</span><span>Background Image</span></button>
+    <button class="nav" data-panel="top-sites-panel"><span class="nav-icon" aria-hidden="true">▦</span><span>Top sites</span></button>
+    <button class="nav" data-panel="themes-panel"><span class="nav-icon" aria-hidden="true">◐</span><span>Themes</span></button>
+    <button class="nav" data-panel="search-panel"><span class="nav-icon" aria-hidden="true">⌕</span><span>Search</span></button>
   </nav>
   <main class="content">
     <button class="close" id="close-customize" aria-label="Close">×</button>
@@ -1357,11 +2030,11 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
       <div class="toggle-row"><span>Show background images</span><label class="toggle-switch" aria-label="Show background images"><input id="show-background" type="checkbox" {{BACKGROUND_CHECKED}}><span class="switch-track" aria-hidden="true"></span></label></div>
       <div class="cards">
         <button class="card {{DEFAULT_SELECTED}}" id="default-background">
-          <span class="preview"><img alt="Linus Browser background" src="data:image/png;base64,{{DEFAULT_WALLPAPER}}"><span class="select-mark">✓</span></span>
+          <span class="preview"><img id="default-preview" alt="Linus Browser background"><span class="select-mark">✓</span></span>
           <span class="card-label">Linus background</span>
         </button>
         <button class="card {{CUSTOM_SELECTED}}" id="choose-background">
-          <span class="preview"><img id="custom-preview" alt="Choose your own background" src="{{WALLPAPER_URI}}"><span class="select-mark">✓</span></span>
+          <span class="preview"><img id="custom-preview" alt="Choose your own background"><span class="select-mark">✓</span></span>
           <span class="card-label">Use your own</span>
         </button>
         <button class="card wallpaper-card {{SOLID_SELECTED}}" id="solid-background" data-style="solid">
@@ -1372,8 +2045,54 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
           <span class="preview"><span class="select-mark">✓</span></span>
           <span class="card-label">Gradient</span>
         </button>
+        <button class="card wallpaper-card {{AURORA_SELECTED}}" id="aurora-background" data-style="aurora">
+          <span class="preview"><span class="select-mark">✓</span></span>
+          <span class="card-label">Aurora</span>
+        </button>
+        <button class="card wallpaper-card {{SUNSET_SELECTED}}" id="sunset-background" data-style="sunset">
+          <span class="preview"><span class="select-mark">✓</span></span>
+          <span class="card-label">Sunset</span>
+        </button>
+        <button class="card wallpaper-card {{OCEAN_SELECTED}}" id="ocean-background" data-style="ocean">
+          <span class="preview"><span class="select-mark">✓</span></span>
+          <span class="card-label">Ocean</span>
+        </button>
+        <button class="card wallpaper-card {{FOREST_SELECTED}}" id="forest-background" data-style="forest">
+          <span class="preview"><span class="select-mark">✓</span></span>
+          <span class="card-label">Forest</span>
+        </button>
       </div>
       <input id="wallpaper-file" type="file" accept="image/png,image/jpeg,image/webp">
+    </section>
+    <section class="panel" id="top-sites-panel">
+      <h2>Top sites</h2>
+      <p class="theme-description">Choose whether your frequently visited sites appear on the new-tab page.</p>
+      <div class="toggle-row"><span>Show top sites</span><label class="toggle-switch" aria-label="Show top sites"><input id="show-top-sites" type="checkbox" {{TOP_SITES_CHECKED}}><span class="switch-track" aria-hidden="true"></span></label></div>
+      <button class="restore-sites" id="restore-hidden-sites" type="button" {{RESTORE_SITES_DISABLED}}>Restore hidden sites</button>
+    </section>
+    <section class="panel" id="themes-panel">
+      <h2>Themes</h2>
+      <p class="theme-description">Choose a color style for the browser and new-tab page.</p>
+      <div class="theme-grid" role="radiogroup" aria-label="Browser theme">
+        <button class="theme-choice {{THEME_DARK_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_DARK_CHECKED}}" data-theme="dark">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Dark mode</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-choice {{THEME_LIGHT_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_LIGHT_CHECKED}}" data-theme="light">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Light mode</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-choice {{THEME_MIDNIGHT_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_MIDNIGHT_CHECKED}}" data-theme="midnight">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Midnight</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-choice {{THEME_FOREST_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_FOREST_CHECKED}}" data-theme="forest">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Forest</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-choice {{THEME_OCEAN_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_OCEAN_CHECKED}}" data-theme="ocean">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Ocean</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-choice {{THEME_WARM_SELECTED}}" type="button" role="radio" aria-checked="{{THEME_WARM_CHECKED}}" data-theme="warm">
+          <span class="theme-swatch" aria-hidden="true"></span><span class="theme-choice-label">Warm</span><span class="theme-choice-check" aria-hidden="true">✓</span>
+        </button>
+      </div>
     </section>
     <section class="panel" id="search-panel">
       <h2>Search</h2>
@@ -1405,12 +2124,11 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
 <script>
   var customize = document.getElementById('customize');
   var customizeBackdrop = document.getElementById('customize-backdrop');
-  var defaultWallpaper = 'data:image/png;base64,{{DEFAULT_WALLPAPER}}';
-  var searchUrls = {
-    duckduckgo: 'https://duckduckgo.com/?q=',
-    google: 'https://www.google.com/search?q=',
-    brave: 'https://search.brave.com/search?q='
-  };
+  var wallpaperUri = getComputedStyle(document.body).getPropertyValue('--wallpaper').trim()
+    .replace(/^url\(["']?/, '').replace(/["']?\)\s*$/, '');
+  var defaultWallpaper = {{DEFAULT_WALLPAPER}};
+  document.getElementById('custom-preview').src = wallpaperUri;
+  document.getElementById('default-preview').src = defaultWallpaper;
   function send(message) {
     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.linus)
       window.webkit.messageHandlers.linus.postMessage(message);
@@ -1419,15 +2137,83 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
     customize.classList.remove('open');
     customizeBackdrop.classList.remove('open');
   }
+  function setWallpaperAccent(red, green, blue) {
+    var max = Math.max(red, green, blue);
+    var min = Math.min(red, green, blue);
+    var saturation = max === 0 ? 0 : (max - min) / max;
+    if (saturation < .28 || max < 58 || max > 245) {
+      red = 255; green = 106; blue = 77;
+    }
+    document.body.style.setProperty('--wallpaper-accent', 'rgb(' + red + ',' + green + ',' + blue + ')');
+    document.body.style.setProperty('--wallpaper-accent-rgb', red + ',' + green + ',' + blue);
+    var surface = [red, green, blue].map(function (channel, index) {
+      return Math.round(channel * .22 + [33, 25, 24][index] * .78);
+    });
+    document.body.style.setProperty('--wallpaper-surface-rgb', surface.join(','));
+  }
+  function refreshWallpaperAccent(style) {
+    var presets = {
+      solid: [112, 145, 255], gradient: [235, 113, 95], aurora: [81, 230, 196],
+      sunset: [255, 183, 94], ocean: [65, 185, 232], forest: [117, 207, 132]
+    };
+    if (presets[style]) {
+      setWallpaperAccent(presets[style][0], presets[style][1], presets[style][2]);
+      return;
+    }
+    setWallpaperAccent(255, 106, 77);
+    var wallpaper = new Image();
+    wallpaper.onload = function () {
+      try {
+        var canvas = document.createElement('canvas');
+        canvas.width = 32; canvas.height = 32;
+        var context = canvas.getContext('2d', { willReadFrequently: true });
+        context.drawImage(wallpaper, 0, 0, 32, 32);
+        var pixels = context.getImageData(0, 0, 32, 32).data;
+        var bins = Object.create(null);
+        for (var i = 0; i < pixels.length; i += 16) {
+          var red = pixels[i], green = pixels[i + 1], blue = pixels[i + 2];
+          var high = Math.max(red, green, blue), low = Math.min(red, green, blue);
+          var saturation = high === 0 ? 0 : (high - low) / high;
+          if (pixels[i + 3] < 96 || saturation < .28 || high < 58 || high > 245) continue;
+          var key = (red >> 4) + ',' + (green >> 4) + ',' + (blue >> 4);
+          var bin = bins[key] || (bins[key] = [0, 0, 0, 0, 0]);
+          bin[0]++; bin[1] += red; bin[2] += green; bin[3] += blue;
+          bin[4] += saturation;
+        }
+        var best = null, bestScore = 0;
+        Object.keys(bins).forEach(function (key) {
+          var bin = bins[key], score = bin[0] * (.5 + bin[4] / bin[0]);
+          if (score > bestScore) { best = bin; bestScore = score; }
+        });
+        if (best) setWallpaperAccent(Math.round(best[1] / best[0]), Math.round(best[2] / best[0]), Math.round(best[3] / best[0]));
+      } catch (error) {
+        console.warn('Could not sample new-tab wallpaper colors:', error);
+      }
+    };
+    wallpaper.src = wallpaperUri;
+  }
+  function setTheme(theme) {
+    if (['dark', 'light', 'midnight', 'forest', 'ocean', 'warm'].indexOf(theme) === -1) return;
+    document.body.classList.remove('theme-dark', 'theme-light', 'theme-midnight', 'theme-forest', 'theme-ocean', 'theme-warm');
+    document.body.classList.add('theme-' + theme);
+    document.querySelectorAll('.theme-choice').forEach(function (choice) {
+      var selected = choice.dataset.theme === theme;
+      choice.classList.toggle('selected', selected);
+      choice.setAttribute('aria-checked', selected ? 'true' : 'false');
+    });
+    send('theme:' + theme);
+  }
   function setWallpaperStyle(style) {
-    document.body.classList.remove('wallpaper-solid', 'wallpaper-gradient');
-    if (style === 'solid' || style === 'gradient')
+    if (['default', 'custom', 'solid', 'gradient', 'aurora', 'sunset', 'ocean', 'forest'].indexOf(style) === -1) return;
+    document.body.classList.remove('wallpaper-solid', 'wallpaper-gradient', 'wallpaper-aurora', 'wallpaper-sunset', 'wallpaper-ocean', 'wallpaper-forest');
+    if (style !== 'default' && style !== 'custom')
       document.body.classList.add('wallpaper-' + style);
     document.querySelectorAll('.wallpaper-card, #default-background, #choose-background').forEach(function (card) {
       card.classList.toggle('selected', card.dataset.style === style || card.id === (style === 'default' ? 'default-background' : style === 'custom' ? 'choose-background' : ''));
     });
     document.body.classList.remove('no-background');
     document.getElementById('show-background').checked = true;
+    refreshWallpaperAccent(style);
     send('wallpaper-style:' + style);
     send('background:1');
   }
@@ -1451,12 +2237,33 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
       button.classList.add('active');
       document.getElementById(button.dataset.panel).classList.add('active');
     });
+    document.querySelectorAll('.theme-choice').forEach(function (choice) {
+      choice.addEventListener('click', function () { setTheme(choice.dataset.theme); });
+    });
+    document.getElementById('show-top-sites').addEventListener('change', function (event) {
+      document.querySelector('.tiles').hidden = !event.target.checked;
+      send('show-top-sites:' + (event.target.checked ? '1' : '0'));
+    });
+    document.getElementById('restore-hidden-sites').addEventListener('click', function () {
+      send('restore-hidden-sites');
+    });
+    document.querySelectorAll('.tile-hide').forEach(function (button) {
+      button.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        var tile = button.closest('.tile-wrap');
+        tile.classList.add('removing');
+        window.setTimeout(function () { tile.remove(); }, 170);
+        send('hide-top-site:' + button.dataset.host);
+      });
+    });
   });
   document.getElementById('show-background').addEventListener('change', function (event) {
     document.body.classList.toggle('no-background', !event.target.checked);
     send('background:' + (event.target.checked ? '1' : '0'));
   });
   document.getElementById('default-background').addEventListener('click', function () {
+    wallpaperUri = defaultWallpaper;
     document.body.style.setProperty('--wallpaper', 'url("' + defaultWallpaper + '")');
     setWallpaperStyle('default');
     document.getElementById('custom-preview').src = defaultWallpaper;
@@ -1472,6 +2279,7 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
     var reader = new FileReader();
     reader.onload = function () {
       var image = String(reader.result);
+      wallpaperUri = image;
       document.body.style.setProperty('--wallpaper', 'url("' + image + '")');
       document.getElementById('custom-preview').src = image;
       setWallpaperStyle('custom');
@@ -1489,6 +2297,8 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
       document.querySelectorAll('.engine-option').forEach(function (option) {
         option.classList.toggle('selected', option.querySelector('input').checked);
       });
+      refreshWallpaperAccent(document.body.classList.contains('wallpaper-custom') ? 'custom' :
+        (document.body.className.match(/wallpaper-(default|solid|gradient|aurora|sunset|ocean|forest)/) || ['wallpaper-default'])[0].replace('wallpaper-', ''));
       send('search:' + input.value);
     });
   });
@@ -1496,10 +2306,7 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
     event.preventDefault();
     var value = document.getElementById('q').value.trim();
     if (!value) return;
-    var looksLikeUrl = /^[^\s]+\.[^\s]+$/.test(value);
-    location.href = looksLikeUrl
-      ? (value.indexOf('://') > 0 ? value : 'https://' + value)
-      : searchUrls[document.querySelector('input[name="search-engine"]:checked').value] + encodeURIComponent(value);
+    send('search-submit:' + value);
   });
 </script>
 </body></html>"##;
@@ -1620,16 +2427,18 @@ const HISTORY_PAGE: &str = r##"<!doctype html>
   });
 </script></body></html>"##;
 
+/// Directory holding the user-editable theme overrides. It follows
+/// `data_dir()` so an overridden profile keeps its theme with it.
+fn theme_dir() -> PathBuf {
+    data_dir()
+}
+
 fn theme_css_path() -> PathBuf {
-    glib::user_config_dir()
-        .join("linus_browser")
-        .join("theme.css")
+    theme_dir().join("theme.css")
 }
 
 fn wallpaper_palette_path() -> PathBuf {
-    glib::user_config_dir()
-        .join("linus_browser")
-        .join("wallpaper-palette.css")
+    theme_dir().join("wallpaper-palette.css")
 }
 
 fn wallpaper_sources() -> Vec<PathBuf> {
@@ -1735,9 +2544,7 @@ fn palette_css_from_bgra(
     // the old theme collapse into a single flat grey slab on dark wallpapers.
     let tint = 0.10;
     let tinted = |base: f32| -> String {
-        let mix = |channel: u8| {
-            (base * (1.0 - tint) + f32::from(channel) * tint).round() as u8
-        };
+        let mix = |channel: u8| (base * (1.0 - tint) + f32::from(channel) * tint).round() as u8;
         format!("rgb({}, {}, {})", mix(r), mix(g), mix(b))
     };
     // Only trust the wallpaper for the accent when it yields a genuinely vivid
@@ -1946,6 +2753,11 @@ struct Tab {
     fingerprint_script: Option<UserScript>,
 }
 
+/// One completed or in-flight download, kept for the downloads page.
+struct DownloadEntry {
+    path: PathBuf,
+}
+
 struct Browser {
     window: ApplicationWindow,
     app: Application,
@@ -1958,7 +2770,6 @@ struct Browser {
     back: Button,
     forward: Button,
     reload: Button,
-    bookmark: Button,
     progress: ProgressBar,
     bookmarks_bar: GtkBox,
     find_bar: GtkBox,
@@ -1975,10 +2786,11 @@ struct Browser {
     downloads_list: GtkBox,
     logo: gdk::Texture,
     logo_b64: String,
-    filter: RefCell<Option<UserContentFilter>>,
+    filter: RefCell<Vec<UserContentFilter>>,
     prefs: RefCell<Prefs>,
     bookmarks: RefCell<Vec<Bookmark>>,
     history: RefCell<Vec<HistoryItem>>,
+    downloads: RefCell<Vec<DownloadEntry>>,
     _theme_monitors: Vec<gio::FileMonitor>,
 }
 
@@ -2087,7 +2899,6 @@ impl Browser {
             uri.as_str()
         };
         self.url_entry.set_text(shown);
-        self.update_bookmark_icon(shown);
         self.sync_shields_ui(shown);
     }
 
@@ -2121,7 +2932,7 @@ impl Browser {
         self.syncing.set(false);
     }
 
-    /// Add or remove the tracker filter on one tab to match the site's Shields state.
+    /// Add or remove the compiled Shields filters on one tab.
     fn apply_shields_for(&self, wv: &WebView, host: &str) {
         let want = !self.prefs.borrow().shields_off.contains(host);
         let tabs = self.tabs.borrow();
@@ -2131,14 +2942,18 @@ impl Browser {
         if tab.filter_on.get() == want {
             return;
         }
-        if let Some(f) = self.filter.borrow().as_ref() {
-            if want {
-                tab.ucm.add_filter(f);
-            } else {
-                tab.ucm.remove_filter(f);
-            }
-            tab.filter_on.set(want);
+        let filters = self.filter.borrow();
+        if filters.is_empty() {
+            return;
         }
+        for filter in filters.iter() {
+            if want {
+                tab.ucm.add_filter(filter);
+            } else {
+                tab.ucm.remove_filter(filter);
+            }
+        }
+        tab.filter_on.set(want);
     }
 
     fn apply_fingerprint_farbling(&self, enabled: bool) {
@@ -2158,15 +2973,6 @@ impl Browser {
             }
             tab.web_view.reload();
         }
-    }
-
-    fn update_bookmark_icon(&self, uri: &str) {
-        let on = self.bookmarks.borrow().iter().any(|b| b.url == uri);
-        self.bookmark.set_icon_name(if on {
-            "starred-symbolic"
-        } else {
-            "non-starred-symbolic"
-        });
     }
 
     fn set_window_title(&self, page_title: &str) {
@@ -2277,7 +3083,14 @@ impl Browser {
             "data:{wallpaper_mime};base64,{}",
             glib::base64_encode(wallpaper_bytes)
         );
-        let default_wallpaper = glib::base64_encode(DEFAULT_NEW_TAB_BACKGROUND);
+        let default_wallpaper = if custom_background.is_some() {
+            format!(
+                "'data:image/png;base64,{}'",
+                glib::base64_encode(DEFAULT_NEW_TAB_BACKGROUND)
+            )
+        } else {
+            "wallpaperUri".to_string()
+        };
         let duckduckgo_logo = format!(
             "data:image/x-icon;base64,{}",
             glib::base64_encode(DUCKDUCKGO_SEARCH_ICON)
@@ -2291,29 +3104,15 @@ impl Browser {
             glib::base64_encode(BRAVE_SEARCH_ICON)
         );
         let search_engine = prefs.search_engine.as_str();
+        let theme = prefs.theme.as_str();
         let show_background = prefs.background_images;
-        let tiles: String = self
-            .bookmarks
-            .borrow()
-            .iter()
-            .filter(|b| b.url.starts_with("http"))
-            .take(8)
-            .map(|b| {
-                let initial = b
-                    .title
-                    .chars()
-                    .next()
-                    .unwrap_or('?')
-                    .to_uppercase()
-                    .to_string();
-                format!(
-                    r#"<a class="tile" href="{}"><div class="ic">{}</div><span>{}</span></a>"#,
-                    esc(&b.url),
-                    esc(&initial),
-                    esc(&b.title)
-                )
-            })
-            .collect();
+        let hidden_top_sites = &prefs.hidden_top_sites;
+        let top_sites = new_tab_top_sites(
+            &self.bookmarks.borrow(),
+            &self.history.borrow(),
+            hidden_top_sites,
+        );
+        let tiles: String = top_sites.iter().map(new_tab_top_site_html).collect();
         NEW_TAB_HTML
             .replace("{{LOGO}}", &self.logo_b64)
             .replace(
@@ -2328,10 +3127,75 @@ impl Browser {
             .replace(
                 "{{BACKGROUND_CLASS}}",
                 &format!(
-                    "{} wallpaper-{}",
+                    "{} wallpaper-{} theme-{}",
                     if show_background { "" } else { "no-background" },
-                    wallpaper_style
+                    wallpaper_style,
+                    theme,
                 ),
+            )
+            .replace(
+                "{{TOP_SITES_HIDDEN}}",
+                if prefs.show_top_sites { "" } else { "hidden" },
+            )
+            .replace(
+                "{{TOP_SITES_CHECKED}}",
+                if prefs.show_top_sites { "checked" } else { "" },
+            )
+            .replace(
+                "{{RESTORE_SITES_DISABLED}}",
+                if hidden_top_sites.is_empty() {
+                    "disabled"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "{{THEME_DARK_SELECTED}}",
+                if theme == "dark" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_DARK_CHECKED}}",
+                if theme == "dark" { "true" } else { "false" },
+            )
+            .replace(
+                "{{THEME_LIGHT_SELECTED}}",
+                if theme == "light" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_LIGHT_CHECKED}}",
+                if theme == "light" { "true" } else { "false" },
+            )
+            .replace(
+                "{{THEME_MIDNIGHT_SELECTED}}",
+                if theme == "midnight" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_MIDNIGHT_CHECKED}}",
+                if theme == "midnight" { "true" } else { "false" },
+            )
+            .replace(
+                "{{THEME_FOREST_SELECTED}}",
+                if theme == "forest" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_FOREST_CHECKED}}",
+                if theme == "forest" { "true" } else { "false" },
+            )
+            .replace(
+                "{{THEME_OCEAN_SELECTED}}",
+                if theme == "ocean" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_OCEAN_CHECKED}}",
+                if theme == "ocean" { "true" } else { "false" },
+            )
+            .replace(
+                "{{THEME_WARM_SELECTED}}",
+                if theme == "warm" { "selected" } else { "" },
+            )
+            .replace(
+                "{{THEME_WARM_CHECKED}}",
+                if theme == "warm" { "true" } else { "false" },
             )
             .replace(
                 "{{BACKGROUND_CHECKED}}",
@@ -2364,6 +3228,38 @@ impl Browser {
             .replace(
                 "{{GRADIENT_SELECTED}}",
                 if wallpaper_style == "gradient" {
+                    "selected"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "{{AURORA_SELECTED}}",
+                if wallpaper_style == "aurora" {
+                    "selected"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "{{SUNSET_SELECTED}}",
+                if wallpaper_style == "sunset" {
+                    "selected"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "{{OCEAN_SELECTED}}",
+                if wallpaper_style == "ocean" {
+                    "selected"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "{{FOREST_SELECTED}}",
+                if wallpaper_style == "forest" {
                     "selected"
                 } else {
                     ""
@@ -2498,6 +3394,32 @@ impl Browser {
             .replace("{{HISTORY_CONTENT}}", &body)
     }
 
+    /// Renders the downloads page body for a given list of entries.
+    fn downloads_page_html(entries: &[DownloadEntry]) -> String {
+        if entries.is_empty() {
+            return Self::internal_html(
+                "Downloads",
+                r#"<p class="empty">Nothing downloaded yet. Files you download appear here.</p>"#,
+            );
+        }
+        let mut body = String::from("<ul>");
+        for entry in entries.iter().rev() {
+            let name = entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| entry.path.to_string_lossy().to_string());
+            body.push_str(&format!(
+                r#"<li><a href="{}">{}</a><small>{}</small></li>"#,
+                esc(&format!("file://{}", entry.path.to_string_lossy())),
+                esc(&name),
+                esc(&entry.path.to_string_lossy())
+            ));
+        }
+        body.push_str("</ul>");
+        Self::internal_html("Downloads", &body)
+    }
+
     fn bookmarks_html(&self) -> String {
         let list = self.bookmarks.borrow();
         if list.is_empty() {
@@ -2523,10 +3445,16 @@ impl Browser {
         let html = match page {
             "history" => self.history_html(),
             "bookmarks" => self.bookmarks_html(),
+            "downloads" => self.downloads_html(),
             _ => return false,
         };
         wv.load_html(&html, Some(&format!("tux://{page}")));
         true
+    }
+
+    /// Lists the files this session downloaded, newest first.
+    fn downloads_html(&self) -> String {
+        Self::downloads_page_html(&self.downloads.borrow())
     }
 }
 
@@ -2536,8 +3464,8 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
     let is_new_tab = uri.is_none();
     let ucm = UserContentManager::new();
     let filter_on = Rc::new(Cell::new(false));
-    if let Some(f) = browser.filter.borrow().as_ref() {
-        ucm.add_filter(f);
+    for filter in browser.filter.borrow().iter() {
+        ucm.add_filter(filter);
         filter_on.set(true);
     }
     let fingerprint_script = if browser.prefs.borrow().fingerprint_farbling {
@@ -2593,7 +3521,32 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
                 return;
             };
             let message = value.to_str().to_string();
-            if let Some(data_url) = message.strip_prefix("wallpaper:") {
+            if let Some(query) = message.strip_prefix("search-submit:") {
+                let target = normalize_input(query, &b.prefs.borrow().search_engine);
+                if target != "about:blank" {
+                    wv.load_uri(&target);
+                }
+            } else if let Some(host) = message.strip_prefix("hide-top-site:") {
+                let host = host.to_ascii_lowercase();
+                if is_valid_site_host(&host) {
+                    let mut prefs = b.prefs.borrow_mut();
+                    prefs.hidden_top_sites.insert(host);
+                    prefs.save();
+                }
+            } else if let Some(value) = message.strip_prefix("show-top-sites:") {
+                if matches!(value, "0" | "1") {
+                    let mut prefs = b.prefs.borrow_mut();
+                    prefs.show_top_sites = value == "1";
+                    prefs.save();
+                }
+            } else if message == "restore-hidden-sites" {
+                {
+                    let mut prefs = b.prefs.borrow_mut();
+                    prefs.hidden_top_sites.clear();
+                    prefs.save();
+                }
+                wv.load_html(&b.new_tab_page(), None);
+            } else if let Some(data_url) = message.strip_prefix("wallpaper:") {
                 if data_url == "default" {
                     let path = data_dir().join("new-tab-background");
                     if let Err(error) = fs::remove_file(&path)
@@ -2639,8 +3592,19 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
                 if let Err(error) = fs::write(dir.join("new-tab-background-mime"), mime) {
                     eprintln!("Could not save new-tab background image type: {error}");
                 }
+            } else if let Some(theme) = message.strip_prefix("theme:") {
+                if is_browser_theme(theme) {
+                    {
+                        let mut prefs = b.prefs.borrow_mut();
+                        prefs.theme = theme.to_string();
+                        prefs.save();
+                    }
+                    for window in b.app.windows() {
+                        apply_browser_theme(&window, theme);
+                    }
+                }
             } else if let Some(value) = message.strip_prefix("wallpaper-style:") {
-                if matches!(value, "default" | "custom" | "solid" | "gradient") {
+                if is_wallpaper_style(value) {
                     let mut prefs = b.prefs.borrow_mut();
                     prefs.wallpaper_style = value.to_string();
                     prefs.save();
@@ -2672,7 +3636,10 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
         });
     }
 
-    let icon = Image::from_paintable(Some(&browser.logo));
+    let icon = Image::new();
+    if is_new_tab {
+        icon.set_paintable(Some(&browser.logo));
+    }
     icon.set_pixel_size(16);
 
     // Let the title use the tab's available width; ellipsize only when the tab
@@ -2751,17 +3718,35 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
         web_view.connect_favicon_notify(move |wv| match wv.favicon() {
             Some(tex) => {
                 icon.set_paintable(Some(&tex));
+                icon.set_visible(true);
                 if !private {
                     save_history_favicon(wv);
                 }
             }
-            None => icon.set_paintable(Some(&logo)),
+            None => {
+                let is_web_page = wv.uri().is_some_and(|uri| is_web_uri(uri.as_str()));
+                if is_web_page {
+                    icon.set_visible(false);
+                } else {
+                    icon.set_paintable(Some(&logo));
+                    icon.set_visible(true);
+                }
+            }
         });
     }
 
     {
         let weak = weak.clone();
+        let icon = icon.clone();
+        let logo = browser.logo.clone();
         web_view.connect_uri_notify(move |wv| {
+            let uri = wv.uri().map(|uri| uri.to_string()).unwrap_or_default();
+            if is_web_uri(&uri) {
+                icon.set_visible(false);
+            } else {
+                icon.set_paintable(Some(&logo));
+                icon.set_visible(true);
+            }
             if let Some(b) = weak.upgrade() {
                 if b.is_current(wv) {
                     b.sync_url_for(wv);
@@ -2806,6 +3791,26 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
                     b.record_history(wv);
                 }
             }
+        });
+    }
+
+    {
+        let weak = weak.clone();
+        web_view.connect_load_failed(move |wv, _, uri, error| {
+            if wv.uri().is_some_and(|current| current.as_str() == uri) {
+                eprintln!("Could not load {uri}: {error}");
+                let html = load_error_html(uri, &error.to_string());
+                wv.load_alternate_html(&html, uri, None);
+                if let Some(b) = weak.upgrade()
+                    && b.is_current(wv)
+                {
+                    b.progress.set_visible(false);
+                    b.reload.set_icon_name("view-refresh-symbolic");
+                    b.reload.set_tooltip_text(Some("Reload"));
+                }
+                return true;
+            }
+            false
         });
     }
 
@@ -2913,37 +3918,85 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
 fn install_updated_filter_rules(
     browser: &Rc<Browser>,
     store: &UserContentFilterStore,
-    rules: String,
+    batches: Vec<String>,
 ) {
     let weak = Rc::downgrade(browser);
-    let store_keep = store.clone();
-    store.save(
-        "tux-shields",
-        &glib::Bytes::from_owned(rules.into_bytes()),
-        None::<&gio::Cancellable>,
-        move |result| {
-            let _keep = &store_keep;
-            let Some(browser) = weak.upgrade() else {
-                return;
-            };
-            match result {
-                Ok(filter) => {
-                    let old_filter = browser.filter.borrow().clone();
-                    *browser.filter.borrow_mut() = Some(filter.clone());
-                    for tab in browser.tabs.borrow().iter() {
-                        if !tab.filter_on.get() {
-                            continue;
-                        }
-                        if let Some(old_filter) = old_filter.as_ref() {
-                            tab.ucm.remove_filter(old_filter);
-                        }
-                        tab.ucm.add_filter(&filter);
+    compile_filter_batches(store, "tux-shields", batches, move |result| {
+        let Some(browser) = weak.upgrade() else {
+            return;
+        };
+        match result {
+            Ok(filters) => {
+                for tab in browser.tabs.borrow().iter() {
+                    if !tab.filter_on.get() {
+                        continue;
+                    }
+                    for old_filter in browser.filter.borrow().iter() {
+                        tab.ucm.remove_filter(old_filter);
+                    }
+                    for filter in &filters {
+                        tab.ucm.add_filter(filter);
                     }
                 }
-                Err(error) => eprintln!("Could not compile updated Shields rules: {error}"),
+                *browser.filter.borrow_mut() = filters;
             }
-        },
-    );
+            Err(error) => eprintln!("Could not compile updated Shields rules: {error}"),
+        }
+    });
+}
+
+fn compile_filter_batches(
+    store: &UserContentFilterStore,
+    identifier_prefix: &str,
+    batches: Vec<String>,
+    callback: impl FnOnce(Result<Vec<UserContentFilter>, String>) + 'static,
+) {
+    let total = batches.len();
+    let results = Rc::new(RefCell::new(vec![None; total]));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let completed = Rc::new(Cell::new(0));
+    let callback = Rc::new(RefCell::new(Some(
+        Box::new(callback) as Box<dyn FnOnce(Result<Vec<UserContentFilter>, String>)>
+    )));
+
+    for (index, rules) in batches.into_iter().enumerate() {
+        let results = results.clone();
+        let errors = errors.clone();
+        let completed = completed.clone();
+        let callback = callback.clone();
+        let store_keep = store.clone();
+        store.save(
+            &format!("{identifier_prefix}-{index}"),
+            &glib::Bytes::from_owned(rules.into_bytes()),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let _keep = &store_keep;
+                match result {
+                    Ok(filter) => results.borrow_mut()[index] = Some(filter),
+                    Err(error) => errors.borrow_mut().push(error.to_string()),
+                }
+
+                let done = completed.get() + 1;
+                completed.set(done);
+                if done != total {
+                    return;
+                }
+
+                let outcome = if errors.borrow().is_empty() {
+                    Ok(results
+                        .borrow_mut()
+                        .drain(..)
+                        .map(|filter| filter.expect("every successful filter must be present"))
+                        .collect())
+                } else {
+                    Err(errors.borrow().join("; "))
+                };
+                if let Some(callback) = callback.borrow_mut().take() {
+                    callback(outcome);
+                }
+            },
+        );
+    }
 }
 
 fn start_filter_list_refresh(browser: &Rc<Browser>, store: UserContentFilterStore) {
@@ -2951,7 +4004,7 @@ fn start_filter_list_refresh(browser: &Rc<Browser>, store: UserContentFilterStor
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result =
-            refresh_filter_lists(&cache_dir).map(|lists| filter_rules_json_with_lists(&lists));
+            refresh_filter_lists(&cache_dir).and_then(|lists| filter_rules_json_batches(&lists));
         if sender.send(result).is_err() {
             eprintln!("Filter-list update result receiver was closed");
         }
@@ -3031,7 +4084,6 @@ fn toggle_bookmark(b: &Rc<Browser>) {
         }
         save_bookmarks(&list);
     }
-    b.update_bookmark_icon(&uri);
     rebuild_bookmarks_bar(b);
 }
 
@@ -3072,6 +4124,7 @@ fn watch_downloads(browser: &Rc<Browser>) {
 
         {
             let name = name.clone();
+            let weak = weak.clone();
             download.connect_decide_destination(move |dl, suggested| {
                 let dir = glib::user_special_dir(glib::UserDirectory::Downloads)
                     .unwrap_or_else(glib::home_dir);
@@ -3082,6 +4135,11 @@ fn watch_downloads(browser: &Rc<Browser>) {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default(),
                 );
+                if let Some(b) = weak.upgrade() {
+                    b.downloads
+                        .borrow_mut()
+                        .push(DownloadEntry { path: path.clone() });
+                }
                 dl.set_destination(&path.to_string_lossy());
                 true
             });
@@ -3146,10 +4204,9 @@ fn zoom(b: &Rc<Browser>, delta: f64) {
 // ───────────────────────────── window ─────────────────────────────
 
 fn build_window(app: &Application, private: bool) {
-    // `gtk-application-prefer-dark-theme` is deprecated (it logs a warning at
-    // startup). The whole chrome is themed by our own stylesheet, so the theme
-    // preference is unnecessary; only tell GTK which accent scheme to assume for
-    // stock widgets we do not draw ourselves.
+    // Theme choices are applied through window CSS classes rather than GTK's
+    // deprecated application-wide dark-theme preference.
+    let prefs = Prefs::load();
     let theme_monitors = load_css();
 
     let logo = gdk::Texture::from_bytes(&glib::Bytes::from_static(TUX_PNG))
@@ -3165,12 +4222,13 @@ fn build_window(app: &Application, private: bool) {
     if private {
         window.add_css_class("private");
     }
+    apply_browser_theme(&window, &prefs.theme);
 
     // ---- tab strip ----
     // The tab box must expand, otherwise tabs pile up on the left and push the
     // trailing controls (tab list, close) past the window edge.
     let tabs_box = GtkBox::new(Orientation::Horizontal, 0);
-    tabs_box.set_hexpand(true);
+    tabs_box.set_hexpand(false);
     tabs_box.set_halign(Align::Start);
     tabs_box.set_valign(Align::Center);
 
@@ -3180,10 +4238,7 @@ fn build_window(app: &Application, private: bool) {
     new_tab_btn.set_has_frame(false);
     new_tab_btn.set_valign(Align::Center);
 
-    let list_btn = MenuButton::builder()
-        .icon_name("pan-down-symbolic")
-        .tooltip_text("Search tabs")
-        .build();
+    let list_btn = MenuButton::builder().icon_name("pan-down-symbolic").build();
     list_btn.add_css_class("tabbar-button");
     list_btn.set_has_frame(false);
     list_btn.set_valign(Align::Center);
@@ -3204,10 +4259,15 @@ fn build_window(app: &Application, private: bool) {
     trailing.append(&list_btn);
     trailing.append(&win_close);
 
+    let tab_group = GtkBox::new(Orientation::Horizontal, 4);
+    tab_group.set_hexpand(true);
+    tab_group.set_valign(Align::Center);
+    tab_group.append(&tabs_box);
+    tab_group.append(&new_tab_btn);
+
     let tabbar = GtkBox::new(Orientation::Horizontal, 4);
     tabbar.add_css_class("tabbar");
-    tabbar.append(&tabs_box);
-    tabbar.append(&new_tab_btn);
+    tabbar.append(&tab_group);
     tabbar.append(&trailing);
 
     let handle = WindowHandle::new();
@@ -3226,10 +4286,6 @@ fn build_window(app: &Application, private: bool) {
     reload.set_tooltip_text(Some("Reload (Ctrl+R)"));
     reload.set_has_frame(false);
 
-    let bookmark = Button::from_icon_name("non-starred-symbolic");
-    bookmark.set_tooltip_text(Some("Bookmark this page (Ctrl+D)"));
-    bookmark.set_has_frame(false);
-
     let url_entry = Entry::builder()
         .hexpand(true)
         .placeholder_text("Search or enter address")
@@ -3238,9 +4294,7 @@ fn build_window(app: &Application, private: bool) {
     url_entry.set_icon_from_paintable(EntryIconPosition::Primary, Some(&logo));
     url_entry.set_icon_activatable(EntryIconPosition::Primary, false);
 
-    // Shields popover (opened from the main menu). It must NOT be parented to
-    // the URL entry at build time: a parented popover is realized as part of
-    // the toolbar and its children painted inside the address pill.
+    // Keep the Shields popover unparented until an anchor opens it.
     let shields_pop = Popover::new();
     let shields_box = GtkBox::new(Orientation::Vertical, 10);
     shields_box.set_margin_top(12);
@@ -3300,11 +4354,6 @@ fn build_window(app: &Application, private: bool) {
     downloads_pop.set_child(Some(&downloads_list));
     downloads_btn.set_popover(Some(&downloads_pop));
 
-    let extensions = Button::from_icon_name("application-x-addon-symbolic");
-    extensions.set_tooltip_text(Some("Extensions (not supported by WebKit)"));
-    extensions.set_sensitive(false);
-    extensions.set_has_frame(false);
-
     let menu = gio::Menu::new();
     let s1 = gio::Menu::new();
     s1.append(Some("New tab"), Some("win.new-tab"));
@@ -3314,6 +4363,11 @@ fn build_window(app: &Application, private: bool) {
     s2.append(Some("Bookmarks"), Some("win.bookmarks"));
     s2.append(Some("History"), Some("win.history"));
     s2.append(Some("Downloads"), Some("win.downloads"));
+    s2.append(Some("All downloads"), Some("win.downloads-page"));
+    s2.append(
+        Some("Open downloads folder"),
+        Some("win.open-downloads-folder"),
+    );
     s2.append(Some("Privacy and Shields"), Some("win.privacy"));
     let s3 = gio::Menu::new();
     s3.append(Some("Show bookmarks bar"), Some("win.toggle-bar"));
@@ -3355,9 +4409,7 @@ fn build_window(app: &Application, private: bool) {
 
     let action_group = GtkBox::new(Orientation::Horizontal, 0);
     action_group.add_css_class("toolbar-group");
-    action_group.append(&bookmark);
     action_group.append(&downloads_btn);
-    action_group.append(&extensions);
     action_group.append(&menu_btn);
 
     let toolbar = GtkBox::new(Orientation::Horizontal, 6);
@@ -3402,7 +4454,6 @@ fn build_window(app: &Application, private: bool) {
     content.append(&find_bar);
     window.set_child(Some(&content));
 
-    let prefs = Prefs::load();
     let fingerprint_seed = match new_fingerprint_seed() {
         Ok(seed) => Some(seed),
         Err(error) => {
@@ -3421,6 +4472,9 @@ fn build_window(app: &Application, private: bool) {
         NetworkSession::default()
     };
     if let Some(session) = &session {
+        if let Some(data_manager) = session.website_data_manager() {
+            data_manager.set_favicons_enabled(true);
+        }
         session.set_itp_enabled(true);
         session.set_tls_errors_policy(TLSErrorsPolicy::Fail);
     }
@@ -3441,7 +4495,6 @@ fn build_window(app: &Application, private: bool) {
         back: back.clone(),
         forward: forward.clone(),
         reload: reload.clone(),
-        bookmark: bookmark.clone(),
         progress,
         bookmarks_bar,
         find_bar,
@@ -3458,10 +4511,11 @@ fn build_window(app: &Application, private: bool) {
         downloads_list,
         logo,
         logo_b64,
-        filter: RefCell::new(None),
+        filter: RefCell::new(Vec::new()),
         prefs: RefCell::new(prefs),
         bookmarks: RefCell::new(load_bookmarks()),
         history: RefCell::new(if private { Vec::new() } else { load_history() }),
+        downloads: RefCell::new(Vec::new()),
         _theme_monitors: theme_monitors,
     });
 
@@ -3490,7 +4544,6 @@ fn build_window(app: &Application, private: bool) {
     });
     on_click(&new_tab_btn, &browser, |b| open_tab(b, None));
     on_click(&win_close, &browser, |b| b.window.close());
-    on_click(&bookmark, &browser, toggle_bookmark);
     on_click(&find_close, &browser, close_find);
     on_click(&find_next, &browser, |b| {
         if let Some(fc) = b.current_webview().and_then(|wv| wv.find_controller()) {
@@ -3643,6 +4696,7 @@ fn build_window(app: &Application, private: bool) {
             for t in b.tabs.borrow().iter() {
                 let btn = Button::with_label(&t.label.text());
                 btn.set_has_frame(false);
+                btn.add_css_class("tab-list-item");
                 if let Some(l) = btn.child().and_then(|c| c.downcast::<Label>().ok()) {
                     l.set_xalign(0.0);
                     l.set_ellipsize(pango::EllipsizeMode::End);
@@ -3732,9 +4786,23 @@ fn build_window(app: &Application, private: bool) {
         b.downloads_btn.set_visible(true);
         b.downloads_btn.popup();
     });
+    add_action(app, &browser, "downloads-page", &[], |b| {
+        open_tab(b, Some("tux://downloads"))
+    });
+    add_action(app, &browser, "open-downloads-folder", &[], |_| {
+        let dir =
+            glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(glib::home_dir);
+        if let Err(error) = gio::AppInfo::launch_default_for_uri(
+            &format!("file://{}", dir.to_string_lossy()),
+            None::<&gio::AppLaunchContext>,
+        ) {
+            eprintln!("Could not open the downloads folder: {error}");
+        }
+    });
     // Shields is parented on demand, under the toolbar, when the menu item is
     // chosen — never at build time, so it cannot leak into the toolbar layout.
     add_action(app, &browser, "privacy", &[], |b| {
+        b.shields_pop.unparent();
         b.shields_pop.set_parent(&b.menu_btn);
         b.shields_pop.set_visible(true);
         b.shields_pop.popup();
@@ -3811,28 +4879,24 @@ fn build_window(app: &Application, private: bool) {
         });
     }
 
-    // Compile the tracker filter first so the very first page is already protected.
+    // Compile built-in Shields rules before opening the first page.
     {
-        let rules = filter_rules_json_with_lists(&FilterListDomains::default());
+        let batches = filter_rules_json_batches(&FilterListDomains::default())
+            .expect("built-in Shields rules should fit in one batch");
         let store = UserContentFilterStore::new(&data_dir().join("filters").to_string_lossy());
-        let store_keep = store.clone();
+        let refresh_store = store.clone();
         let weak = Rc::downgrade(&browser);
-        store.save(
-            "tux-shields",
-            &glib::Bytes::from_owned(rules.into_bytes()),
-            None::<&gio::Cancellable>,
-            move |result| {
-                let _keep = &store_keep;
-                if let Some(b) = weak.upgrade() {
-                    match result {
-                        Ok(f) => *b.filter.borrow_mut() = Some(f),
-                        Err(e) => eprintln!("Could not compile Shields rules: {e}"),
-                    }
-                    open_tab(&b, None);
-                    start_filter_list_refresh(&b, store_keep.clone());
-                }
-            },
-        );
+        compile_filter_batches(&store, "tux-shields", batches, move |result| {
+            let Some(b) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(filters) => *b.filter.borrow_mut() = filters,
+                Err(error) => eprintln!("Could not compile Shields rules: {error}"),
+            }
+            open_tab(&b, None);
+            start_filter_list_refresh(&b, refresh_store);
+        });
     }
 
     window.present();
@@ -3853,14 +4917,24 @@ mod tests {
     #[test]
     fn new_tab_customize_panel_has_opaque_modal_and_synchronized_backdrop() {
         assert!(NEW_TAB_HTML.contains("background: #21191a"));
-        assert!(
-            NEW_TAB_HTML
-                .contains(".nav.active { color: #ffb1a3; background: rgba(255,111,85,.13); }")
-        );
+        assert!(NEW_TAB_HTML.contains(
+            ".side h1 { margin: 4px 14px 28px; color: #f2e7e5; font-size: 17px; font-weight: 500;"
+        ));
+        assert!(NEW_TAB_HTML.contains(
+            ".nav.active { color: #ffb1a3; background: rgba(255,111,85,.13); border-color:"
+        ));
         assert!(NEW_TAB_HTML.contains(".nav.active::before"));
-        assert!(NEW_TAB_HTML.contains("background: #ffaaa0; border: 3px solid #fff"));
+        assert!(
+            NEW_TAB_HTML.contains("background: #ff9786; border: 2px solid rgba(255,255,255,.94)")
+        );
         assert!(NEW_TAB_HTML.contains("border: solid #fff; border-width: 0 3px 3px 0"));
         assert!(NEW_TAB_HTML.contains(".card.selected .select-mark { display: grid; }"));
+        assert!(NEW_TAB_HTML.contains(".card.selected { background: rgba(255,111,85,.09);"));
+        assert!(NEW_TAB_HTML.contains(".engine-list { display: grid; gap: 8px;"));
+        assert!(
+            NEW_TAB_HTML.contains(".theme-choice.selected { border-color: rgba(255,154,137,.7);")
+        );
+        assert!(NEW_TAB_HTML.contains("class=\"nav-icon\" aria-hidden=\"true\""));
         assert!(NEW_TAB_HTML.contains("class=\"toggle-switch\""));
         assert!(NEW_TAB_HTML.contains("class=\"switch-track\""));
         assert!(NEW_TAB_HTML.contains("class=\"customize-backdrop\""));
@@ -3883,7 +4957,22 @@ mod tests {
         assert!(!GOOGLE_SEARCH_ICON.is_empty());
         assert!(!BRAVE_SEARCH_ICON.is_empty());
         assert!(NEW_TAB_HTML.contains("send('search:' + input.value);"));
-        assert!(NEW_TAB_HTML.contains("input[name=\"search-engine\"]:checked"));
+        assert!(NEW_TAB_HTML.contains("name=\"search-engine\""));
+        assert!(NEW_TAB_HTML.contains("send('search-submit:' + value);"));
+    }
+
+    #[test]
+    fn new_tab_search_and_brand_icon_are_centered_near_the_top() {
+        assert!(NEW_TAB_HTML.contains("align-items: center; justify-content: flex-start;"));
+        assert!(NEW_TAB_HTML.contains("padding: 47px clamp(24px, 3.45vw, 48px) 24px;"));
+        assert!(NEW_TAB_HTML.contains(".mode { width: min(420px, 100%); text-align: center;"));
+        assert!(NEW_TAB_HTML.contains("#f { width: min(420px, 100%); height: 48px;"));
+        assert!(
+            NEW_TAB_HTML
+                .contains("<img alt=\"Linus Browser\" src=\"data:image/png;base64,{{LOGO}}\">")
+        );
+        assert!(NEW_TAB_HTML.contains("#f img { width: 18px; height: 18px;"));
+        assert!(NEW_TAB_HTML.contains("justify-content: center; width: min(720px, 100%)"));
     }
 
     #[test]
@@ -3941,7 +5030,9 @@ mod tests {
             let numbers: Vec<u32> = line
                 .split_whitespace()
                 .filter_map(|part| {
-                    part.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok()
+                    part.trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse()
+                        .ok()
                 })
                 .collect();
             assert!(
@@ -3982,7 +5073,8 @@ mod tests {
             css.find("@define-color accent_color #123456;")
                 < css.find("@define-color accent_color #abcdef;")
         );
-        assert!(theme_css_path().ends_with("linus_browser/theme.css"));
+        assert!(theme_css_path().ends_with("theme.css"));
+        assert_eq!(theme_css_path().parent(), Some(theme_dir().as_path()));
         assert!(CSS.contains("window, window.background { background-color: @window_bg;"));
         assert!(CSS.contains("@define-color window_bg @shell;"));
     }
@@ -4016,25 +5108,47 @@ mod tests {
         // No stray GTK focus rectangles: every interactive rule opts out.
         assert!(CSS.contains("*:focus-visible { outline: none; }"));
 
-        // The address bar is a borderless white pill; focus never adds a ring.
-        assert!(CSS.contains("entry.url-entry:focus-within"));
-        assert!(CSS.contains("border-radius: 999px"));
+        // The address bar is a compact, dark, accent-bordered field.
+        assert!(CSS.contains("@define-color field #241b1b;"));
+        assert!(CSS.contains("border-radius: 10px"));
+        assert!(CSS.contains("min-height: 32px"));
         let url_entry_rule = CSS
             .split("entry.url-entry:focus, entry.url-entry:focus-within {")
             .nth(1)
             .and_then(|rest| rest.split('}').next())
             .expect("address bar focus rule");
         assert!(
-            !url_entry_rule.contains("border-color") && !url_entry_rule.contains("0 0 0"),
-            "address bar focus must not draw an outline/ring: {url_entry_rule}"
+            url_entry_rule.contains("border-color: @accent_color"),
+            "address bar focus should use the current theme accent: {url_entry_rule}"
         );
+        assert!(CSS.contains(
+            ".tabbar {\n    background: @shell;\n    padding: 0 6px;\n    min-height: 38px;"
+        ));
+        assert!(CSS.contains(
+            ".toolbar-row {\n    background: @chrome;\n    padding: 3px 8px;\n    min-height: 38px;"
+        ));
 
         // Tabs are flat; only the raised active surface differs.
         assert!(CSS.contains(".browser-tab.active {"));
+        assert!(CSS.contains(".browser-tab.active label { font-weight: 400; }"));
         assert!(!CSS.contains(".browser-tab.active::after"));
 
         // Popovers and the private theme.
         assert!(CSS.contains("popover.background, popover > contents"));
+        assert!(CSS.contains("popover.menu {\n    background: transparent;"));
+        assert!(CSS.contains("popover.menu > contents {\n    background: @popover_bg;"));
+        assert!(CSS.contains("    padding: 7px;\n}\npopover.menu modelbutton"));
+        assert!(CSS.contains("popover.menu modelbutton accelerator"));
+        assert!(CSS.contains(".tab-list-item {\n    background: transparent;"));
+        assert!(CSS.contains("tooltip, tooltip.background"));
+        assert!(CSS.contains(
+            "tooltip, tooltip.background {\n    background: @popover_bg;\n    color: @fg;\n    border: 1px solid @hairline_strong;\n    border-radius: 14px;"
+        ));
+        assert!(
+            CSS.contains("    box-shadow: 0 18px 48px rgba(0,0,0,0.62);\n    padding: 7px;\n}")
+        );
+        assert!(CSS.contains("tooltip label { color: @fg; padding: 4px 7px;"));
+        assert!(CSS.contains("window.theme-light tooltip label"));
         assert!(CSS.contains("window.private .toolbar-row"));
 
         // The stylesheet must be syntactically well formed (balanced braces and
@@ -4064,18 +5178,133 @@ mod tests {
     }
 
     #[test]
-    fn new_tab_background_gallery_offers_and_applies_all_four_styles() {
+    fn new_tab_background_gallery_offers_and_applies_all_styles() {
         assert!(NEW_TAB_HTML.contains("send('wallpaper-style:' + style);"));
         assert!(NEW_TAB_HTML.contains("body.wallpaper-solid"));
         assert!(NEW_TAB_HTML.contains("body.wallpaper-gradient"));
+        assert!(NEW_TAB_HTML.contains("body.wallpaper-aurora"));
+        assert!(NEW_TAB_HTML.contains("body.wallpaper-sunset"));
+        assert!(NEW_TAB_HTML.contains("body.wallpaper-ocean"));
+        assert!(NEW_TAB_HTML.contains("body.wallpaper-forest"));
+        assert!(NEW_TAB_HTML.contains("refreshWallpaperAccent(style);"));
+        assert!(NEW_TAB_HTML.contains("--wallpaper-accent-rgb"));
         assert!(NEW_TAB_HTML.contains("id=\"default-background\""));
         assert!(NEW_TAB_HTML.contains("id=\"choose-background\""));
+        assert_eq!(NEW_TAB_HTML.matches("{{WALLPAPER_URI}}").count(), 1);
+        assert!(NEW_TAB_HTML.contains("var defaultWallpaper = {{DEFAULT_WALLPAPER}};"));
+        assert!(
+            NEW_TAB_HTML.contains("document.getElementById('custom-preview').src = wallpaperUri;")
+        );
+        assert!(
+            NEW_TAB_HTML
+                .contains("document.getElementById('default-preview').src = defaultWallpaper;")
+        );
+        assert!(NEW_TAB_HTML.contains("wallpaperUri = image;"));
         assert!(NEW_TAB_HTML.contains("id=\"solid-background\""));
         assert!(NEW_TAB_HTML.contains("id=\"gradient-background\""));
+        assert!(NEW_TAB_HTML.contains("id=\"aurora-background\""));
+        assert!(NEW_TAB_HTML.contains("id=\"sunset-background\""));
+        assert!(NEW_TAB_HTML.contains("id=\"ocean-background\""));
+        assert!(NEW_TAB_HTML.contains("id=\"forest-background\""));
+        for style in [
+            "default", "custom", "solid", "gradient", "aurora", "sunset", "ocean", "forest",
+        ] {
+            assert!(is_wallpaper_style(style));
+        }
+        assert!(!is_wallpaper_style("unknown"));
         assert_eq!(effective_wallpaper_style("default", true), "default");
         assert_eq!(effective_wallpaper_style("custom", false), "default");
         assert_eq!(effective_wallpaper_style("custom", true), "custom");
         assert_eq!(effective_wallpaper_style("gradient", true), "gradient");
+        assert_eq!(effective_wallpaper_style("aurora", true), "aurora");
+    }
+
+    #[test]
+    fn browser_themes_are_available_and_applied_to_the_browser_chrome() {
+        for theme in ["dark", "light", "midnight", "forest", "ocean", "warm"] {
+            assert!(is_browser_theme(theme));
+            assert!(NEW_TAB_HTML.contains(&format!("data-theme=\"{theme}\"")));
+            if theme != "dark" {
+                assert!(CSS.contains(&format!("window.theme-{theme}")));
+            }
+        }
+        assert!(!is_browser_theme("unknown"));
+        assert!(NEW_TAB_HTML.contains("Dark mode"));
+        assert!(NEW_TAB_HTML.contains("Light mode"));
+        assert!(NEW_TAB_HTML.contains("data-panel=\"themes-panel\""));
+        assert!(NEW_TAB_HTML.contains("send('theme:' + theme);"));
+        assert!(NEW_TAB_HTML.contains("send('search-submit:' + value);"));
+        assert!(NEW_TAB_HTML.contains("Ask anything, find anything..."));
+        assert!(NEW_TAB_HTML.contains("data-panel=\"top-sites-panel\""));
+        assert!(NEW_TAB_HTML.contains("id=\"show-top-sites\""));
+        assert!(NEW_TAB_HTML.contains("send('hide-top-site:' + button.dataset.host);"));
+        assert!(NEW_TAB_HTML.contains("send('restore-hidden-sites');"));
+    }
+
+    #[test]
+    fn new_tab_speed_dial_prioritizes_bookmarks_then_frequent_sites() {
+        let bookmarks = vec![
+            Bookmark {
+                title: "Saved".to_string(),
+                url: "https://saved.example/path".to_string(),
+            },
+            Bookmark {
+                title: "Invalid".to_string(),
+                url: "javascript:alert(1)".to_string(),
+            },
+        ];
+        let history = vec![
+            HistoryItem {
+                time: 1,
+                title: "Most visited".to_string(),
+                url: "https://popular.example/old".to_string(),
+            },
+            HistoryItem {
+                time: 2,
+                title: "Most visited".to_string(),
+                url: "https://popular.example/new".to_string(),
+            },
+            HistoryItem {
+                time: 3,
+                title: "Recent".to_string(),
+                url: "https://recent.example/".to_string(),
+            },
+            HistoryItem {
+                time: 4,
+                title: "Duplicate saved".to_string(),
+                url: "https://saved.example/another".to_string(),
+            },
+        ];
+
+        let sites = new_tab_top_sites(&bookmarks, &history, &HashSet::new());
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| site.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Saved", "Most visited", "Recent"]
+        );
+        assert_eq!(sites[1].url, "https://popular.example/new");
+        let tile = new_tab_top_site_html(&sites[0]);
+        assert!(tile.contains("href=\"https://saved.example/path\""));
+        assert!(tile.contains("class=\"tile-initial\""));
+        assert!(tile.contains("class=\"tile-hide\""));
+        assert!(tile.contains("data-host=\"saved.example\""));
+        assert!(tile.contains("referrerpolicy=\"no-referrer\""));
+        assert!(NEW_TAB_HTML.contains(".tile .ic img"));
+
+        let hidden = HashSet::from(["popular.example".to_string()]);
+        let sites = new_tab_top_sites(&bookmarks, &history, &hidden);
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| site.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Saved", "Recent"]
+        );
+        assert!(is_valid_site_host("sub.example.com"));
+        assert!(!is_valid_site_host("invalid host"));
+        assert!(!is_valid_site_host("bad..example"));
     }
 
     #[test]
@@ -4100,36 +5329,100 @@ mod tests {
     }
 
     #[test]
-    fn filter_list_parser_keeps_safe_domain_rules_and_exceptions() {
+    fn filter_list_parser_preserves_supported_scope_and_resource_options() {
         let lists = parse_filter_list_domains(
             r#"
                 ! comment
                 [Adblock Plus 2.0]
                 ||ads.example.com^
                 ||TRACKER.example.net^$script,third-party
+                ||cdn.example.net^
+                ||google.com^
+                ||youtube.com/pagead/
                 @@||allowed.example.org^
                 ||site.example.com/banner
                 ||scoped.example.com^$domain=publisher.example
+                ||excluded.example.com^$domain=~trusted.example
+                ||mixed.example.com^$domain=publisher.example|~trusted.example
                 ||first-party.example.com^$~third-party
+                ||important.example.com^$important
+                ||disabled.example.com^$script
+                ||disabled.example.com^$script,badfilter
                 example.com##.ad
             "#,
         );
 
-        assert_eq!(
-            lists.blocked.into_iter().collect::<HashSet<_>>(),
-            HashSet::from([
-                "ads.example.com".to_string(),
-                "tracker.example.net".to_string(),
-            ])
-        );
-        assert_eq!(lists.allowed, vec!["allowed.example.org".to_string()]);
+        let blocked: HashMap<_, _> = lists
+            .blocked
+            .into_iter()
+            .map(|rule| (rule.host.clone(), rule))
+            .collect();
+        assert!(blocked.contains_key("ads.example.com"));
+        assert!(blocked.contains_key("cdn.example.net"));
+        assert!(blocked.contains_key("google.com"));
+        assert_eq!(blocked["youtube.com"].path.as_deref(), Some("/pagead/"));
+        assert!(!blocked["youtube.com"].third_party);
+        assert_eq!(blocked["site.example.com"].path.as_deref(), Some("/banner"));
+
+        let tracker = &blocked["tracker.example.net"];
+        assert_eq!(tracker.resource_types, ["script"]);
+        assert!(tracker.third_party);
+
+        let scoped = &blocked["scoped.example.com"];
+        assert_eq!(scoped.include_domains, ["publisher.example"]);
+        assert!(scoped.exclude_domains.is_empty());
+
+        let excluded = &blocked["excluded.example.com"];
+        assert!(excluded.include_domains.is_empty());
+        assert_eq!(excluded.exclude_domains, ["trusted.example"]);
+        assert!(!blocked.contains_key("mixed.example.com"));
+
+        assert!(!blocked["first-party.example.com"].third_party);
+        assert!(!blocked.contains_key("important.example.com"));
+        assert!(!blocked.contains_key("disabled.example.com"));
+        assert_eq!(lists.allowed.len(), 1);
+        assert_eq!(lists.allowed[0].host, "allowed.example.org");
     }
 
     #[test]
     fn downloaded_domain_rules_and_exceptions_are_emitted_for_webkit() {
         let lists = FilterListDomains {
-            blocked: vec!["ads.example.com".into()],
-            allowed: vec!["allowed.example.com".into()],
+            blocked: vec![
+                FilterDomainRule {
+                    host: "ads.example.com".into(),
+                    path: None,
+                    include_domains: vec!["publisher.example".into()],
+                    exclude_domains: Vec::new(),
+                    resource_types: vec!["script".into()],
+                    third_party: true,
+                },
+                FilterDomainRule {
+                    host: "youtube.com".into(),
+                    path: Some("/pagead/".into()),
+                    include_domains: Vec::new(),
+                    exclude_domains: Vec::new(),
+                    resource_types: Vec::new(),
+                    third_party: true,
+                },
+            ],
+            allowed: vec![
+                FilterDomainRule {
+                    host: "allowed.example.com".into(),
+                    path: None,
+                    include_domains: Vec::new(),
+                    exclude_domains: Vec::new(),
+                    resource_types: Vec::new(),
+                    third_party: true,
+                },
+                FilterDomainRule {
+                    host: "excepted.example.com".into(),
+                    path: None,
+                    include_domains: Vec::new(),
+                    exclude_domains: vec!["trusted.example".into()],
+                    resource_types: Vec::new(),
+                    third_party: true,
+                },
+            ],
         };
         let rules: serde_json::Value = serde_json::from_str(&filter_rules_json_with_lists(&lists))
             .expect("generated list rules must be valid JSON");
@@ -4139,7 +5432,20 @@ mod tests {
             rule["trigger"]["url-filter"]
                 .as_str()
                 .is_some_and(|pattern| pattern.contains("ads\\.example\\.com"))
+                && rule["trigger"]["if-domain"][0] == "publisher.example"
+                && rule["trigger"]["resource-type"][0] == "script"
                 && rule["action"]["type"] == "block"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["trigger"]["url-filter"] == r"^https?://([^/]+\.)?youtube\.com/pagead/"
+                && rule["action"]["type"] == "block"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["trigger"]["url-filter"]
+                .as_str()
+                .is_some_and(|pattern| pattern.contains("excepted\\.example\\.com"))
+                && rule["trigger"]["unless-domain"][0] == "trusted.example"
+                && rule["action"]["type"] == "ignore-previous-rules"
         }));
         assert!(rules.iter().any(|rule| {
             rule["trigger"]["url-filter"]
@@ -4147,6 +5453,167 @@ mod tests {
                 .is_some_and(|pattern| pattern.contains("allowed\\.example\\.com"))
                 && rule["action"]["type"] == "ignore-previous-rules"
         }));
+    }
+
+    #[test]
+    fn filter_rule_batches_keep_exceptions_with_their_domain_rules() {
+        let blocked_rule = FilterDomainRule {
+            host: "same.example.com".into(),
+            path: None,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            resource_types: Vec::new(),
+            third_party: true,
+        };
+        let lists = FilterListDomains {
+            blocked: vec![blocked_rule.clone()],
+            allowed: vec![blocked_rule],
+        };
+        let batches =
+            filter_rules_json_batches(&lists).expect("sample filter rules should fit in one batch");
+
+        assert_eq!(batches.len(), 1);
+        let rules: serde_json::Value =
+            serde_json::from_str(&batches[0]).expect("batch should be valid JSON");
+        let domain_rules: Vec<_> = rules
+            .as_array()
+            .expect("batch rules should be an array")
+            .iter()
+            .filter(|rule| {
+                rule["trigger"]["url-filter"]
+                    .as_str()
+                    .is_some_and(|pattern| pattern.contains("same\\.example\\.com"))
+            })
+            .collect();
+        assert_eq!(domain_rules.len(), 2);
+        assert_eq!(domain_rules[0]["action"]["type"], "block");
+        assert_eq!(domain_rules[1]["action"]["type"], "ignore-previous-rules");
+    }
+
+    #[test]
+    fn filter_batches_respect_the_rule_limit_and_repeat_exceptions() {
+        let blocked = (0..16_100)
+            .map(|index| FilterDomainRule {
+                host: format!("ad{index}.example.org"),
+                path: None,
+                include_domains: Vec::new(),
+                exclude_domains: Vec::new(),
+                resource_types: Vec::new(),
+                third_party: true,
+            })
+            .collect();
+        let lists = FilterListDomains {
+            blocked,
+            allowed: vec![FilterDomainRule {
+                host: "allowed.example.org".into(),
+                path: None,
+                include_domains: Vec::new(),
+                exclude_domains: Vec::new(),
+                resource_types: Vec::new(),
+                third_party: true,
+            }],
+        };
+        let batches =
+            filter_rules_json_batches(&lists).expect("sample filter rules should fit in batches");
+
+        assert!(batches.len() > 1);
+        for batch in batches {
+            let rules: serde_json::Value =
+                serde_json::from_str(&batch).expect("batch should be valid JSON");
+            let rules = rules.as_array().expect("batch should be an array");
+            assert!(rules.len() <= MAX_RULES_PER_FILTER);
+            assert!(rules.iter().any(|rule| {
+                rule["action"]["type"] == "ignore-previous-rules"
+                    && rule["trigger"]["url-filter"]
+                        .as_str()
+                        .is_some_and(|pattern| pattern.contains("allowed\\.example\\.org"))
+            }));
+        }
+    }
+
+    #[test]
+    fn webkit_compiles_a_full_sized_shields_batch() {
+        let mut blocked: Vec<_> = (0..MAX_RULES_PER_FILTER - TRACKER_DOMAINS.len() - 5)
+            .map(|index| FilterDomainRule {
+                host: format!("ad{index}.example.org"),
+                path: None,
+                include_domains: vec!["publisher.example".into()],
+                exclude_domains: Vec::new(),
+                resource_types: vec![
+                    "document".into(),
+                    "font".into(),
+                    "image".into(),
+                    "media".into(),
+                    "raw".into(),
+                    "script".into(),
+                    "style-sheet".into(),
+                ],
+                third_party: true,
+            })
+            .collect();
+        blocked.push(FilterDomainRule {
+            host: "excluded.example.org".into(),
+            path: None,
+            include_domains: Vec::new(),
+            exclude_domains: vec!["trusted.example".into()],
+            resource_types: vec!["script".into()],
+            third_party: true,
+        });
+        blocked.push(FilterDomainRule {
+            host: "youtube.com".into(),
+            path: Some("/youtubei/v1/player/ad_break".into()),
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            resource_types: Vec::new(),
+            third_party: false,
+        });
+        let lists = FilterListDomains {
+            blocked,
+            allowed: vec![FilterDomainRule {
+                host: "allowed.example.org".into(),
+                path: None,
+                include_domains: Vec::new(),
+                exclude_domains: Vec::new(),
+                resource_types: Vec::new(),
+                third_party: true,
+            }],
+        };
+        let batches =
+            filter_rules_json_batches(&lists).expect("sample filter rules should fit in one batch");
+        assert_eq!(batches.len(), 1);
+
+        let path = std::env::temp_dir().join(format!(
+            "linus-browser-filter-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&path).expect("temporary filter directory should be created");
+        let store = UserContentFilterStore::new(&path.to_string_lossy());
+        let main_loop = glib::MainLoop::new(None, false);
+        let result = Rc::new(RefCell::new(None));
+        let result_for_callback = result.clone();
+        let loop_for_callback = main_loop.clone();
+        store.save(
+            "filter-test",
+            &glib::Bytes::from_owned(batches.into_iter().next().unwrap().into_bytes()),
+            None::<&gio::Cancellable>,
+            move |compiled| {
+                *result_for_callback.borrow_mut() =
+                    Some(compiled.map(|_| ()).map_err(|error| error.to_string()));
+                loop_for_callback.quit();
+            },
+        );
+        main_loop.run();
+        drop(store);
+        fs::remove_dir_all(&path).expect("temporary filter directory should be removed");
+        result
+            .borrow_mut()
+            .take()
+            .expect("WebKit compilation callback should run")
+            .expect("WebKit should accept a full-sized generated filter");
     }
 
     #[test]
@@ -4194,9 +5661,46 @@ mod tests {
         assert!(AD_CLEANER_SCRIPT.contains("[data-ad-slot]"));
         assert!(AD_CLEANER_SCRIPT.contains("ytd-ad-slot-renderer"));
         assert!(AD_CLEANER_SCRIPT.contains("iframe[src*=\"doubleclick.net\"]"));
+        assert!(AD_CLEANER_SCRIPT.contains(".ad-container"));
+        assert!(!AD_CLEANER_SCRIPT.contains("    .ad,"));
+        assert!(!AD_CLEANER_SCRIPT.contains("    .ads,"));
         assert!(AD_CLEANER_SCRIPT.contains(".ytp-ad-skip-button"));
         assert!(AD_CLEANER_SCRIPT.contains("video.currentTime = video.duration"));
         assert!(AD_CLEANER_SCRIPT.contains(".html5-video-player.ad-showing"));
+    }
+
+    #[test]
+    fn failed_website_loads_show_a_safe_retry_page() {
+        let html = load_error_html(
+            "https://example.com/?q=<bad>",
+            "Connection failed: <offline>",
+        );
+        assert!(html.contains("This page couldn't be loaded"));
+        assert!(html.contains("https://example.com/?q=&lt;bad&gt;"));
+        assert!(html.contains("Connection failed: &lt;offline&gt;"));
+        assert!(html.contains("Try again"));
+    }
+
+    #[test]
+    fn downloads_page_lists_files_newest_first_and_escapes_names() {
+        let empty = Browser::downloads_page_html(&[]);
+        assert!(empty.contains("Nothing downloaded yet"));
+
+        let entries = vec![
+            DownloadEntry {
+                path: PathBuf::from("/tmp/first.txt"),
+            },
+            DownloadEntry {
+                path: PathBuf::from("/tmp/a&b.pdf"),
+            },
+        ];
+        let html = Browser::downloads_page_html(&entries);
+        assert!(html.contains("href=\"file:///tmp/a&amp;b.pdf\""));
+        assert!(html.contains("a&amp;b.pdf"));
+        assert!(
+            html.find("a&amp;b.pdf").unwrap() < html.find("first.txt").unwrap(),
+            "newest download must be listed first"
+        );
     }
 
     #[test]
@@ -4232,8 +5736,24 @@ mod tests {
             "https://www.youtube.com/watch?v=video123"
         );
         assert_eq!(
+            normalize_input("youtube.com", "duckduckgo"),
+            "https://www.youtube.com/"
+        );
+        assert_eq!(
+            normalize_input("YouTube.com/watch?v=video123", "duckduckgo"),
+            "https://www.youtube.com/watch?v=video123"
+        );
+        assert_eq!(
             normalize_input("cats and dogs", "google"),
             "https://www.google.com/search?q=cats%20and%20dogs"
         );
+    }
+
+    #[test]
+    fn web_pages_do_not_use_the_browser_logo_as_a_favicon_fallback() {
+        assert!(is_web_uri("https://example.com"));
+        assert!(is_web_uri("http://example.com"));
+        assert!(!is_web_uri("about:blank"));
+        assert!(!is_web_uri("tux://history"));
     }
 }
