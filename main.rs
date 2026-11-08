@@ -57,12 +57,13 @@ const FINGERPRINT_FARBLING_SCRIPT: &str = r#"
     return (value ^ (value >>> 16)) >>> 0;
   };
   const farblePixels = (pixels) => {
-    for (let i = 0; i < pixels.length; i += 4) {
+    for (let i = 0; i < pixels.length; i += 32) {
       const value = noise(i >>> 2);
-      if ((value & 7) === 0) {
-        const channel = (value >>> 3) % 3;
-        pixels[i + channel] = (pixels[i + channel] + ((value >>> 5) & 1 ? 1 : 255)) & 255;
-      }
+      const sample = i + (((value >>> 3) & 7) * 4);
+      if (sample >= pixels.length) continue;
+      const channel = (value >>> 6) % 3;
+      pixels[sample + channel] =
+        (pixels[sample + channel] + ((value >>> 5) & 1 ? 1 : 255)) & 255;
     }
   };
 
@@ -115,7 +116,7 @@ const FINGERPRINT_FARBLING_SCRIPT: &str = r#"
         context.drawImage(this, 0, 0);
         return new Promise((resolve, reject) => {
           const options = args[0] || {};
-          copy.toBlob(
+          nativeToBlob.call(copy,
             blob => blob ? resolve(blob) : reject(new Error('Canvas export failed')),
             options.type,
             options.quality
@@ -160,7 +161,7 @@ fn fingerprint_farbling_script(seed: &str) -> UserScript {
     let source = FINGERPRINT_FARBLING_SCRIPT.replace("__SESSION_SEED__", seed);
     UserScript::new(
         &source,
-        UserContentInjectedFrames::AllFrames,
+        UserContentInjectedFrames::TopFrame,
         UserScriptInjectionTime::Start,
         &[],
         &[],
@@ -338,6 +339,7 @@ struct Prefs {
     wallpaper_style: String,
     fingerprint_farbling: bool,
     shields_off: HashSet<String>,
+    welcome_flight_shown: bool,
 }
 
 impl Prefs {
@@ -354,6 +356,7 @@ impl Prefs {
             wallpaper_style: "default".to_string(),
             fingerprint_farbling: true,
             shields_off: HashSet::new(),
+            welcome_flight_shown: false,
         };
         let mut wallpaper_style_configured = false;
         for line in read_lines("prefs.conf") {
@@ -389,6 +392,7 @@ impl Prefs {
                             .map(String::from)
                             .collect()
                     }
+                    "welcome_flight_shown" => p.welcome_flight_shown = v == "1",
                     _ => {}
                 }
             }
@@ -420,6 +424,7 @@ impl Prefs {
                 format!("wallpaper_style={}", self.wallpaper_style),
                 format!("fingerprint_farbling={}", b(self.fingerprint_farbling)),
                 format!("shields_off={}", off.join(",")),
+                format!("welcome_flight_shown={}", b(self.welcome_flight_shown)),
             ],
         );
     }
@@ -469,6 +474,20 @@ fn effective_wallpaper_style(style: &str, has_custom_background: bool) -> &str {
     } else {
         style
     }
+}
+
+fn should_show_first_run_welcome(private: bool, welcome_shown: bool) -> bool {
+    !private && !welcome_shown
+}
+
+fn first_run_welcome_html() -> String {
+    String::from(
+        r##"<section class="launch-splash" role="status" aria-live="polite"><div class="launch-scene"><div class="sky-cloud cloud-one" aria-hidden="true"></div><div class="sky-cloud cloud-two" aria-hidden="true"></div><div class="landing-strip" aria-hidden="true"><span></span></div><div class="landing-dust" aria-hidden="true"><i></i><i></i><i></i></div><div class="arrival-plane" aria-hidden="true"><svg viewBox="0 0 240 140"><path fill="#b9c3d1" d="m45 82-31 14 2 5 42-9Zm128 1 42 13 4-5-35-20Z"/><path fill="#d45743" d="m19 70 35-5 18-21 8 1-7 22 75-1 23-19 9 2-11 20 31 5q16 3 23 11-7 8-24 10l-38 2 10 18-9 3-22-20-77 2 8 18-8 2-19-19-42 2Q6 83 5 76q2-4 14-6Z"/><path fill="#f2b8a9" d="m39 74 31-4-8 7-24 2Zm104 8 24 1-8 5-18-1Z"/><path fill="#f5f7fa" d="M97 54q17-13 34-1l8 13-38 1Z"/><path fill="#202934" d="M101 56q14-10 26 0l6 9h-33Z"/><path fill="#ffcf64" d="M106 58h9v7h-9Zm11 0h9v7h-9Z"/><path fill="none" stroke="#313943" stroke-width="3" d="M103 57h27m-15 1v6"/><path fill="#202934" d="M94 51q1-19 17-22 19-2 23 18l-3 12-10-2-2-11-8 8-11-1Z"/><path fill="#f5f1e9" d="M101 45q10-11 23-2l5 13q-13 11-27 0Z"/><path fill="none" stroke="#313943" stroke-width="4" d="M98 42q16-10 31 0"/><path fill="#202934" d="M103 39q6-5 12 0v9q-6 4-12 0Zm12 0q7-5 13 0v9q-6 4-13 0Z"/><circle cx="109" cy="44" r="3.3" fill="#86d8ed"/><circle cx="122" cy="44" r="3.3" fill="#86d8ed"/><path fill="#e1a34b" d="m112 51 9 1-5 6Z"/><path class="scarf-tail" fill="#d9383e" d="M95 57q12 7 28 1l2 7q-14 8-31 2l-7 13-7-2 8-20Z"/><path fill="#ba252f" d="M98 59q12 4 25-1l2 6q-14 7-28 2Z"/><circle cx="214" cy="77" r="5" fill="#f5f7fa"/><path class="propeller" d="M226 77h12m-6-12v24" stroke="#626e7e" stroke-width="3" stroke-linecap="round"/></svg></div><p class="launch-message">Welcome to Linus Browser</p></div></section>"##
+    )
+    .replace(
+        "<div class=\"landing-dust\"",
+        "<div class=\"landing-shadow\" aria-hidden=\"true\"></div><div class=\"landing-dust\"",
+    )
 }
 
 // ───────────────────────────── shields data ─────────────────────────────
@@ -1095,8 +1114,15 @@ fn load_error_html(uri: &str, error: &str) -> String {
         *{{box-sizing:border-box}} body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#171416;color:#f4eeee;font:15px system-ui,sans-serif}}
         main{{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #493632;border-radius:16px;background:#211b1b}}
         h1{{margin:0 0 12px;font-size:22px}} p{{color:#c3b6b3;line-height:1.55;overflow-wrap:anywhere}}
-        code{{color:#f0d7d1}} a{{display:inline-block;margin-top:12px;padding:9px 16px;border-radius:9px;background:#b84b3a;color:white;text-decoration:none}}
-        </style></head><body><main><h1>This page couldn't be loaded</h1><p><code>{}</code></p><p>{}</p><a href="{}">Try again</a></main></body></html>"#,
+        code{{color:#f0d7d1}} #connection-status{{padding:12px;border-radius:9px;background:#302727;color:#f4eeee}}
+        ul{{padding-left:22px;color:#c3b6b3;line-height:1.6}} a{{display:inline-block;margin-top:12px;padding:9px 16px;border-radius:9px;background:#b84b3a;color:white;text-decoration:none}}
+        </style></head><body><main><h1>This page couldn't be loaded</h1><p><code>{}</code></p><p>{}</p>
+        <h2>Check your connection</h2><p id="connection-status" role="status" aria-live="polite">Checking whether your device is online…</p>
+        <p>Common causes include:</p><ul><li>Wi-Fi disconnected or airplane mode enabled</li><li>Router or internet service temporarily unavailable</li><li>VPN, proxy, DNS, or firewall interruption</li><li>The website itself is temporarily unavailable</li></ul>
+        <p>Check Wi-Fi and airplane mode in your system settings. If possible, test another site or device; then retry this page.</p>
+        <a href="{}">Try again</a>
+        <script>const status = document.getElementById('connection-status'); function updateConnectionStatus() {{ status.textContent = navigator.onLine ? 'Your device reports that it is online. The internet, DNS, VPN, or website may still be unavailable.' : 'Your device reports that it is offline. Reconnect to Wi-Fi or another network, then retry.'; }} window.addEventListener('online', updateConnectionStatus); window.addEventListener('offline', updateConnectionStatus); updateConnectionStatus();</script>
+        </main></body></html>"#,
         esc(uri),
         esc(error),
         esc(uri)
@@ -1830,6 +1856,81 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   .stage > * { pointer-events: auto; }
   .mode { width: min(420px, 100%); text-align: center; color: #e8e8ec; font-size: 12px;
           letter-spacing: .02em; text-shadow: 0 2px 10px #000; }
+  body.first-run { background: #fff !important; color: #292b36; }
+  body.first-run > :not(.launch-splash) { display: none !important; }
+  .launch-splash { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+                   overflow: hidden; background: #fff; color: #292b36;
+                   font-family: system-ui, sans-serif; }
+  .launch-scene { position: relative; width: min(760px, 88vw); height: min(420px, 58vh);
+                  min-height: 250px; }
+  .sky-cloud { position: absolute; width: 82px; height: 20px; border-radius: 999px;
+               background: #f2f5fa; opacity: .8; }
+  .sky-cloud::before, .sky-cloud::after { content: ""; position: absolute; bottom: 5px;
+               border-radius: 50%; background: inherit; }
+  .sky-cloud::before { left: 16px; width: 28px; height: 28px; }
+  .sky-cloud::after { left: 38px; width: 38px; height: 38px; }
+  .cloud-one { left: 12%; top: 20%; transform: scale(.8);
+               animation: cloud-drift 8s ease-in-out infinite alternate; }
+  .cloud-two { right: 15%; top: 35%; transform: scale(.58); opacity: .55;
+               animation: cloud-drift 10s ease-in-out -2s infinite alternate-reverse; }
+  .landing-strip { position: absolute; left: 12%; right: 12%; bottom: 23%;
+                   height: 3px; border-radius: 3px; background: #d7dbe3; }
+  .landing-strip span { position: absolute; left: 36%; right: 36%; top: 0; height: 3px;
+                        background: repeating-linear-gradient(90deg, #aeb5c2 0 18px, transparent 18px 34px); }
+  .landing-shadow { position: absolute; left: calc(50% - 78px); bottom: 21%;
+                    width: 156px; height: 12px; border-radius: 50%;
+                    background: rgba(57,68,84,.16); opacity: 0;
+                    animation: shadow-arrives 4.2s ease-out forwards; }
+  .arrival-plane { position: absolute; left: calc(50% - 120px); bottom: calc(23% - 63px); width: 240px;
+                   height: 140px; opacity: 0; transform-origin: 50% 70%;
+                   animation: plane-arrival 4.2s cubic-bezier(.2,.7,.25,1) forwards; }
+  .arrival-plane svg { position: absolute; inset: 0; width: 100%; height: 100%;
+                       overflow: visible; filter: drop-shadow(0 6px 3px rgba(43,53,68,.14)); }
+  .arrival-plane .scarf-tail { transform-box: fill-box; transform-origin: 100% 50%;
+                               animation: scarf-flutter .24s ease-in-out infinite alternate; }
+  .arrival-plane .propeller { transform-box: fill-box; transform-origin: 50% 50%;
+                              animation: propeller-spin .12s linear infinite; }
+  .landing-dust { position: absolute; left: calc(50% - 42px); bottom: 22%; width: 84px; height: 20px; }
+  .landing-dust i { position: absolute; bottom: 0; width: 14px; height: 14px; border-radius: 50%;
+                    background: #e8ebf0; opacity: 0; animation: dust-puff .9s ease-out 3.75s both; }
+  .landing-dust i:nth-child(1) { left: 8px; }
+  .landing-dust i:nth-child(2) { left: 34px; animation-delay: 3.85s; }
+  .landing-dust i:nth-child(3) { left: 61px; animation-delay: 3.78s; }
+  .launch-message { position: absolute; left: 0; right: 0; bottom: 7%; margin: 0;
+                    text-align: center; color: #292b36; font-size: clamp(22px, 3vw, 30px);
+                    font-weight: 600; letter-spacing: .01em; opacity: 0;
+                    animation: welcome-arrives .65s cubic-bezier(.2,.75,.3,1) 4.05s both; }
+  @keyframes plane-arrival {
+    0% { opacity: 0; transform: translate(-82vw, -155px) rotate(-15deg); }
+    7% { opacity: 1; }
+    34% { transform: translate(-35vw, -120px) rotate(-9deg); }
+    61% { transform: translate(-12vw, -66px) rotate(-4deg); }
+    78% { transform: translate(0, 0) rotate(0); }
+    84% { transform: translate(0, -9px) rotate(-1deg); }
+    90%, 100% { opacity: 1; transform: translate(0, 0) rotate(0); }
+  }
+  @keyframes propeller-spin { to { transform: rotate(360deg); } }
+  @keyframes scarf-flutter { to { transform: rotate(-9deg) skewY(-5deg); } }
+  @keyframes cloud-drift { to { margin-left: 24px; } }
+  @keyframes shadow-arrives {
+    0%, 62% { opacity: 0; transform: scaleX(.55); }
+    78%, 100% { opacity: 1; transform: scaleX(1); }
+  }
+  @keyframes dust-puff {
+    0% { opacity: 0; transform: translateY(3px) scale(.5); }
+    28% { opacity: .7; }
+    100% { opacity: 0; transform: translateY(-18px) scale(1.3); }
+  }
+  @keyframes welcome-arrives {
+    from { opacity: 0; transform: translateY(14px) scale(.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .arrival-plane { animation-duration: .8s; }
+    .arrival-plane .scarf-tail, .arrival-plane .propeller, .sky-cloud,
+    .landing-shadow, .landing-dust i { animation: none; }
+    .launch-message { animation-delay: .85s; }
+  }
   #f { width: min(420px, 100%); height: 48px; padding: 0 14px;
        display: flex; align-items: center; gap: 10px;
        background: rgba(var(--wallpaper-surface-rgb),.92); backdrop-filter: blur(14px);
@@ -2001,7 +2102,8 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   }
   @media (max-height: 480px) { .customize { height: calc(100vh - 16px); } .content { padding-top: 24px; } }
 </style></head>
-<body class="{{BACKGROUND_CLASS}}" style='--wallpaper: url("{{WALLPAPER_URI}}")'>
+<body class="{{BACKGROUND_CLASS}} {{FIRST_RUN_CLASS}}" style='--wallpaper: url("{{WALLPAPER_URI}}")'>
+{{WELCOME_HTML}}
 <button id="customize-button" class="gear" aria-label="Customize new tab" title="Customize">
   <img alt="" src="data:image/png;base64,{{SETTINGS_ICON}}">
 </button>
@@ -2132,6 +2234,11 @@ const NEW_TAB_HTML: &str = r##"<!doctype html>
   function send(message) {
     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.linus)
       window.webkit.messageHandlers.linus.postMessage(message);
+  }
+  var arrivalPlane = document.querySelector('.arrival-plane');
+  if (arrivalPlane) {
+    var welcomeDelay = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 2200 : 6000;
+    window.setTimeout(function () { send('welcome-finished'); }, welcomeDelay);
   }
   function closeCustomize() {
     customize.classList.remove('open');
@@ -2786,6 +2893,7 @@ struct Browser {
     downloads_list: GtkBox,
     logo: gdk::Texture,
     logo_b64: String,
+    welcome_pending: Cell<bool>,
     filter: RefCell<Vec<UserContentFilter>>,
     prefs: RefCell<Prefs>,
     bookmarks: RefCell<Vec<Bookmark>>,
@@ -3056,6 +3164,12 @@ impl Browser {
     // ----- generated pages -----
 
     fn new_tab_page(&self) -> String {
+        let is_first_run = self.welcome_pending.get();
+        let welcome_html = if is_first_run {
+            first_run_welcome_html()
+        } else {
+            String::new()
+        };
         let prefs = self.prefs.borrow();
         let custom_background = if prefs.wallpaper_style == "custom" {
             fs::read(data_dir().join("new-tab-background")).ok()
@@ -3121,6 +3235,11 @@ impl Browser {
             )
             .replace("{{WALLPAPER_URI}}", &wallpaper_uri)
             .replace("{{DEFAULT_WALLPAPER}}", default_wallpaper.as_str())
+            .replace("{{WELCOME_HTML}}", &welcome_html)
+            .replace(
+                "{{FIRST_RUN_CLASS}}",
+                if is_first_run { "first-run" } else { "" },
+            )
             .replace("{{DUCKDUCKGO_LOGO}}", &duckduckgo_logo)
             .replace("{{GOOGLE_LOGO}}", &google_logo)
             .replace("{{BRAVE_LOGO}}", &brave_logo)
@@ -3479,7 +3598,7 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
     };
     let ad_cleaner = UserScript::new(
         AD_CLEANER_SCRIPT,
-        UserContentInjectedFrames::AllFrames,
+        UserContentInjectedFrames::TopFrame,
         UserScriptInjectionTime::Start,
         &[],
         &[],
@@ -3496,6 +3615,20 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
     let web_view = builder.build();
     web_view.set_hexpand(true);
     web_view.set_vexpand(true);
+    {
+        let window = browser.window.clone();
+        web_view.connect_enter_fullscreen(move |_| {
+            window.fullscreen();
+            true
+        });
+    }
+    {
+        let window = browser.window.clone();
+        web_view.connect_leave_fullscreen(move |_| {
+            window.unfullscreen();
+            true
+        });
+    }
     if let Some(s) = WebViewExt::settings(&web_view) {
         s.set_enable_developer_extras(true);
         s.set_javascript_can_open_windows_automatically(false);
@@ -3521,7 +3654,10 @@ fn open_tab(browser: &Rc<Browser>, uri: Option<&str>) {
                 return;
             };
             let message = value.to_str().to_string();
-            if let Some(query) = message.strip_prefix("search-submit:") {
+            if message == "welcome-finished" && b.welcome_pending.get() {
+                b.welcome_pending.set(false);
+                wv.load_html(&b.new_tab_page(), None);
+            } else if let Some(query) = message.strip_prefix("search-submit:") {
                 let target = normalize_input(query, &b.prefs.borrow().search_engine);
                 if target != "about:blank" {
                     wv.load_uri(&target);
@@ -4206,7 +4342,12 @@ fn zoom(b: &Rc<Browser>, delta: f64) {
 fn build_window(app: &Application, private: bool) {
     // Theme choices are applied through window CSS classes rather than GTK's
     // deprecated application-wide dark-theme preference.
-    let prefs = Prefs::load();
+    let mut prefs = Prefs::load();
+    let welcome_pending = should_show_first_run_welcome(private, prefs.welcome_flight_shown);
+    if welcome_pending {
+        prefs.welcome_flight_shown = true;
+        prefs.save();
+    }
     let theme_monitors = load_css();
 
     let logo = gdk::Texture::from_bytes(&glib::Bytes::from_static(TUX_PNG))
@@ -4454,6 +4595,22 @@ fn build_window(app: &Application, private: bool) {
     content.append(&find_bar);
     window.set_child(Some(&content));
 
+    let toolbar_for_fullscreen = toolbar.clone();
+    let titlebar_for_fullscreen = handle.clone();
+    let bookmarks_for_fullscreen = bookmarks_bar.clone();
+    let bookmarks_were_visible = Rc::new(Cell::new(bookmarks_bar.is_visible()));
+    window.connect_fullscreened_notify(move |window| {
+        let is_fullscreen = window.is_fullscreen();
+        toolbar_for_fullscreen.set_visible(!is_fullscreen);
+        titlebar_for_fullscreen.set_visible(!is_fullscreen);
+        if is_fullscreen {
+            bookmarks_were_visible.set(bookmarks_for_fullscreen.is_visible());
+            bookmarks_for_fullscreen.set_visible(false);
+        } else {
+            bookmarks_for_fullscreen.set_visible(bookmarks_were_visible.get());
+        }
+    });
+
     let fingerprint_seed = match new_fingerprint_seed() {
         Ok(seed) => Some(seed),
         Err(error) => {
@@ -4511,6 +4668,7 @@ fn build_window(app: &Application, private: bool) {
         downloads_list,
         logo,
         logo_b64,
+        welcome_pending: Cell::new(welcome_pending),
         filter: RefCell::new(Vec::new()),
         prefs: RefCell::new(prefs),
         bookmarks: RefCell::new(load_bookmarks()),
@@ -4915,6 +5073,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_run_welcome_is_only_shown_once_in_a_regular_window() {
+        assert!(should_show_first_run_welcome(false, false));
+        assert!(!should_show_first_run_welcome(false, true));
+        assert!(!should_show_first_run_welcome(true, false));
+
+        let html = first_run_welcome_html();
+        assert!(html.contains("role=\"status\" aria-live=\"polite\""));
+        assert!(html.contains("<div class=\"arrival-plane\""));
+        assert!(html.contains("<svg viewBox=\"0 0 240 140\""));
+        assert!(html.contains("class=\"scarf-tail\""));
+        assert!(html.contains("fill=\"#d9383e\""));
+        assert!(html.contains("fill=\"#86d8ed\""));
+        assert!(html.contains("class=\"landing-shadow\""));
+        assert!(html.contains("Welcome to Linus Browser"));
+        assert!(NEW_TAB_HTML.contains("body.first-run { background: #fff !important;"));
+        assert!(NEW_TAB_HTML.contains("@keyframes plane-arrival"));
+        assert!(NEW_TAB_HTML.contains("@keyframes scarf-flutter"));
+        assert!(NEW_TAB_HTML.contains("@keyframes propeller-spin"));
+        assert!(NEW_TAB_HTML.contains("@keyframes dust-puff"));
+        assert!(NEW_TAB_HTML.contains("var welcomeDelay = window.matchMedia"));
+        assert!(NEW_TAB_HTML.contains("send('welcome-finished');"));
+        assert!(NEW_TAB_HTML.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(NEW_TAB_HTML.contains("{{WELCOME_HTML}}"));
+        assert!(NEW_TAB_HTML.contains("{{FIRST_RUN_CLASS}}"));
+    }
+
+    #[test]
     fn new_tab_customize_panel_has_opaque_modal_and_synchronized_backdrop() {
         assert!(NEW_TAB_HTML.contains("background: #21191a"));
         assert!(NEW_TAB_HTML.contains(
@@ -5314,6 +5499,9 @@ mod tests {
         assert!(script.contains("CanvasRenderingContext2D.prototype"));
         assert!(script.contains("HTMLCanvasElement.prototype.toDataURL"));
         assert!(script.contains("HTMLCanvasElement.prototype.toBlob"));
+        assert!(script.contains("i += 32"));
+        assert!(script.contains("nativeToBlob.call(copy"));
+        assert!(!script.contains("copy.toBlob("));
         assert!(script.contains("prototype.readPixels"));
         assert!(script.contains("WebKit WebGL"));
         assert!(!script.contains("__SESSION_SEED__"));
@@ -5679,6 +5867,12 @@ mod tests {
         assert!(html.contains("https://example.com/?q=&lt;bad&gt;"));
         assert!(html.contains("Connection failed: &lt;offline&gt;"));
         assert!(html.contains("Try again"));
+        assert!(html.contains("navigator.onLine"));
+        assert!(html.contains("Wi-Fi disconnected or airplane mode enabled"));
+        assert!(html.contains("Router or internet service temporarily unavailable"));
+        assert!(html.contains("VPN, proxy, DNS, or firewall interruption"));
+        assert!(html.contains("addEventListener('online'"));
+        assert!(html.contains("Reconnect to Wi-Fi or another network"));
     }
 
     #[test]
